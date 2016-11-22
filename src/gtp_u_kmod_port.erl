@@ -80,7 +80,7 @@ init([Name, SocketOpts]) ->
 
     FD0 = gen_socket:getfd(GTP0),
     FD1u = gen_socket:getfd(GTP1u),
-    {ok, GTPDev} = gtp_kernel:dev_create("gtp0", FD0, FD1u, SocketOpts),
+    {ok, GTPDev} = gtp_u_kernel:dev_create("gtp0", FD0, FD1u, SocketOpts),
 
     State = #state{name = Name,
 		   ip = IP,
@@ -97,21 +97,21 @@ handle_call({create_pdp_context, PeerIP, LocalTEI, RemoteTEI, Args} = _Request,
 	    _From, #state{gtp_dev = GTPDev} = State) ->
 
     lager:info("KMOD Port Create PDP Context Call ~p: ~p", [_From, _Request]),
-    Reply = gtp_kernel:create_pdp_context(GTPDev, 1, PeerIP, Args, LocalTEI, RemoteTEI),
+    Reply = gtp_u_kernel:create_pdp_context(GTPDev, 1, PeerIP, Args, LocalTEI, RemoteTEI),
     {reply, Reply, State};
 
 handle_call({update_pdp_context, PeerIP, LocalTEI, RemoteTEI, Args} = _Request,
 	    _From, #state{gtp_dev = GTPDev} = State) ->
 
     lager:info("KMOD Port Update PDP Context Call ~p: ~p", [_From, _Request]),
-    Reply = gtp_kernel:update_pdp_context(GTPDev, 1, PeerIP, Args, LocalTEI, RemoteTEI),
+    Reply = gtp_u_kernel:update_pdp_context(GTPDev, 1, PeerIP, Args, LocalTEI, RemoteTEI),
     {reply, Reply, State};
 
 handle_call({delete_pdp_context, PeerIP, LocalTEI, RemoteTEI, Args} = _Request,
 	    _From, #state{gtp_dev = GTPDev} = State) ->
 
     lager:info("KMOD Port Delete PDP Context Call ~p: ~p", [_From, _Request]),
-    Reply = gtp_kernel:delete_pdp_context(GTPDev, 1, PeerIP, Args, LocalTEI, RemoteTEI),
+    Reply = gtp_u_kernel:delete_pdp_context(GTPDev, 1, PeerIP, Args, LocalTEI, RemoteTEI),
     {reply, Reply, State};
 
 handle_call(_Request, _From, State) ->
