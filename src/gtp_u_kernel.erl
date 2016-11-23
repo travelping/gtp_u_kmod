@@ -50,13 +50,7 @@ init([Device, FD0, FD1u, Opts]) ->
     #file_descriptor{module = prim_file,
 		     data   = {_Port, NsFd}} = FDesc,
 
-    {ok, RtNl} = socket(netlink, raw, ?NETLINK_ROUTE, []),
-    ok = gen_socket:bind(RtNl, netlink:sockaddr_nl(netlink, 0, -1)),
-
-    {ok, RtNlNs} = socket(netlink, raw, ?NETLINK_ROUTE, Opts),
-    ok = gen_socket:bind(RtNlNs, netlink:sockaddr_nl(netlink, 0, -1)),
-    ok = netlink:setsockopt(RtNlNs, sol_netlink, netlink_add_membership, rtnlgrp_link),
-
+    {RtNl, RtNlNs} = netlink_sockets(Opts),
     CreateGTPLinkInfo = [{fd0, FD0}, {fd1, FD1u}, {hashsize, 131072}],
     CreateGTPData = netlink:linkinfo_enc(inet, "gtp", CreateGTPLinkInfo),
     CreateGTPMsg = {inet,arphrd_none, 0, [up], [up],
@@ -79,7 +73,7 @@ init([Device, FD0, FD1u, Opts]) ->
     lists:foreach(fun(R) -> add_route(RtNlNs, GtpIfIdx, R) end, Routes),
 
     {ok, GtpGenlFam} = get_family("gtp"),
-    {ok, GtpNl} = socket(netlink, raw, ?NETLINK_GENERIC, []),
+    {ok, GtpNl} = gen_socket:socket(netlink, raw, ?NETLINK_GENERIC),
     ok = gen_socket:bind(GtpNl, netlink:sockaddr_nl(netlink, 0, 0)),
 
     {ok, #state{ns = NsFd, gtp_nl = GtpNl, rt_nl = RtNl, rt_nl_ns = RtNlNs, gtp_genl_family = GtpGenlFam, gtp_ifidx = GtpIfIdx}}.
@@ -202,13 +196,22 @@ get_ns_fd(Opts) ->
 %%             gen_socket:raw_socketat(NetNs, Family, Type, Protocol)
 %%     end.
 
-socket(Family, Type, Protocol, Opts) ->
-    case proplists:get_value(netns, Opts) of
-        undefined ->
-            gen_socket:socket(Family, Type, Protocol);
-        NetNs ->
-            gen_socket:socketat(NetNs, Family, Type, Protocol)
-    end.
+netlink_sockets(Opts) ->
+    {ok, RtNl} = gen_socket:socket(netlink, raw, ?NETLINK_ROUTE),
+    ok = gen_socket:bind(RtNl, netlink:sockaddr_nl(netlink, 0, -1)),
+
+    RtNlNs =
+	case proplists:get_value(netns, Opts) of
+	    undefined ->
+		RtNl;
+	    NetNs ->
+		{ok, RtNlNs1} = gen_socket:socketat(NetNs, netlink, raw, ?NETLINK_ROUTE),
+		ok = gen_socket:bind(RtNlNs1, netlink:sockaddr_nl(netlink, 0, -1)),
+		ok = netlink:setsockopt(RtNlNs1, sol_netlink, netlink_add_membership, rtnlgrp_link),
+		RtNlNs1
+	end,
+    ok = netlink:setsockopt(RtNlNs, sol_netlink, netlink_add_membership, rtnlgrp_link),
+    {RtNl, RtNlNs}.
 
 get_family(Family) ->
     {ok, S} = gen_socket:socket(netlink, raw, ?NETLINK_GENERIC),
