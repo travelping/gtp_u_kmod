@@ -220,19 +220,18 @@ get_family(Family) ->
 		   seq   = Seq,
 		   pid   = 0,
 		   msg = Get},
-    ok = nl_simple_request(S, ?NETLINK_GENERIC, Req),
-    gen_socket:close(S),
-    lager:debug("Request: ~p", [Req]),
 
-    receive
-	#netlink{type = ctrl, seq = Seq, msg = {newfamily, _, _, Attrs}} ->
-	    {_, FamilyId} = lists:keyfind(family_id, 1, Attrs),
-	    {ok, FamilyId}
-    after
-	5000 ->
-	    lager:error("timeout genl family"),
-	    {error, unknown}
-    end.
+    Return =
+	case nl_simple_request(S, ?NETLINK_GENERIC, Req) of
+	    #netlink{type = ctrl, seq = Seq, msg = {newfamily, _, _, Attrs}} ->
+		{_, FamilyId} = lists:keyfind(family_id, 1, Attrs),
+		{ok, FamilyId};
+	    Other ->
+		lager:error("genl family got ~p", [Other]),
+		{error, unknown}
+	end,
+    gen_socket:close(S),
+    Return.
 
 wait_for_interface(Socket, Device) ->
     receive
@@ -259,31 +258,45 @@ add_route(Socket, IfIdx, {{_,_,_,_} = IP, Len}) ->
 		     msg   = Msg},
     nl_simple_request(Socket, ?NETLINK_ROUTE, Req).
 
+nl_simple_response(error, {0, _}, _Response) ->
+    ok;
+nl_simple_response(error, {Code, _}, _Response) ->
+    {error, Code};
+nl_simple_response(_, _, Response) ->
+    Response.
+
 nl_simple_response(_Seq, []) ->
     continue;
-nl_simple_response(Seq, [R = #rtnetlink{type = error, seq = Seq, msg = {Code, _}} | Next ]) ->
+nl_simple_response(Seq, [Response = #rtnetlink{type = Type, seq = Seq, msg = Msg} | Next ]) ->
     nl_simple_response(-1, Next),
-    lager:info("R: ~p", [R]),
-    if Code == 0 -> ok;
-       true      -> {error, Code}
-    end;
-nl_simple_response(Seq, [R = #netlink{type = error, seq = Seq, msg = {Code, _}} | Next]) ->
+    nl_simple_response(Type, Msg, Response);
+nl_simple_response(Seq, [Response = #netlink{type = Type, seq = Seq, msg = Msg} | Next]) ->
     nl_simple_response(-1, Next),
-    lager:info("R: ~p", [R]),
-    if Code == 0 -> ok;
-       true      -> {error, Code}
-    end;
+    nl_simple_response(Type, Msg, Response);
 nl_simple_response(Seq, [Other | Next]) ->
     self() ! Other,
     nl_simple_response(Seq, Next).
 
 wait_for_response(Socket, Protocol, Seq, Cb) ->
-    Response = process_answer(Socket, Protocol, Cb, []),
-    case nl_simple_response(Seq, Response) of
-	continue ->
-	    wait_for_response(Socket, Protocol, Seq, Cb);
-	Other ->
-	    Other
+    ok = gen_socket:input_event(Socket, true),
+    receive
+	{Socket, input_ready} ->
+	    Response = process_answer(Socket, Protocol, Cb, []),
+	    case nl_simple_response(Seq, Response) of
+		continue ->
+		    wait_for_response(Socket, Protocol, Seq, Cb);
+		Other ->
+		    Other
+	    end;
+
+	#rtnetlink{type = Type, seq = Seq, msg = Msg} = Response ->
+	    nl_simple_response(Type, Msg, Response);
+
+	#netlink{type = Type, seq = Seq, msg = Msg} = Response ->
+	    nl_simple_response(Type, Msg, Response)
+    after
+	1000 ->
+	    {error, timeout}
     end.
 
 nl_simple_request(Socket, Protocol, #rtnetlink{seq = Seq} = Req)  ->
