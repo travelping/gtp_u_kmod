@@ -46,11 +46,12 @@ delete_pdp_context(Server, Version, SGSN, MS, LocalTEI, RemoteTEI) ->
 %%%===================================================================
 
 init([Device, FD0, FD1u, Opts]) ->
-    {ok, FDesc} = get_ns_fd(Opts),
+    VrfOpts = proplists:get_value(vrf, Opts, []),
+    {ok, FDesc} = get_ns_fd(VrfOpts),
     #file_descriptor{module = prim_file,
 		     data   = {_Port, NsFd}} = FDesc,
 
-    {RtNl, RtNlNs} = netlink_sockets(Opts),
+    {RtNl, RtNlNs} = netlink_sockets(VrfOpts),
     CreateGTPLinkInfo = [{fd0, FD0}, {fd1, FD1u}, {hashsize, 131072}],
     CreateGTPData = netlink:linkinfo_enc(inet, "gtp", CreateGTPLinkInfo),
     CreateGTPMsg = {inet,arphrd_none, 0, [up], [up],
@@ -69,7 +70,7 @@ init([Device, FD0, FD1u, Opts]) ->
 
     {ok, GtpIfIdx} = wait_for_interface(RtNlNs, Device),
 
-    Routes = proplists:get_value(routes, Opts, []),
+    Routes = proplists:get_value(routes, VrfOpts, []),
     lists:foreach(fun(R) -> add_route(RtNlNs, GtpIfIdx, R) end, Routes),
 
     {ok, GtpGenlFam} = get_family("gtp"),
