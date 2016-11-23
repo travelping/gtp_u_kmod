@@ -67,11 +67,7 @@ init([Device, FD0, FD1u, Opts]) ->
     lager:debug("CreateGTPReq: ~p", [CreateGTPReq]),
 
     ok = nl_simple_request(RtNl, ?NETLINK_ROUTE, CreateGTPReq),
-
-    {ok, GtpIfIdx} = wait_for_interface(RtNlNs, Device),
-
-    Routes = proplists:get_value(routes, VrfOpts, []),
-    lists:foreach(fun(R) -> add_route(RtNlNs, GtpIfIdx, R) end, Routes),
+    GtpIfIdx = configure_vrf(RtNlNs, Device, VrfOpts),
 
     {ok, GtpGenlFam} = get_family("gtp"),
     {ok, GtpNl} = gen_socket:socket(netlink, raw, ?NETLINK_GENERIC),
@@ -251,16 +247,72 @@ wait_for_interface(Socket, Device) ->
 	    {error, timeout}
     end.
 
-add_route(Socket, IfIdx, {{_,_,_,_} = IP, Len}) ->
+get_interface_rt_table(Socket, VRF) when is_list(VRF) ->
     Seq = erlang:unique_integer([positive]),
-    Msg = {inet, Len, 0, 0, main, static, universe, unicast, [],
+    Msg = {unspec, arphrd_netrom, 0, [], [], [{ifname, VRF}]},
+    Req = #rtnetlink{type  = getlink,
+		     flags = [request],
+		     seq   = Seq,
+		     pid   = 0,
+		     msg   = Msg},
+    case nl_simple_request(Socket, ?NETLINK_ROUTE, Req) of
+	 #rtnetlink{type  = newlink, msg = {Family, _, IfIdx, _, _, Attrs}} ->
+	    LinkInfo = proplists:get_value(linkinfo, Attrs, []),
+	    Kind = proplists:get_value(kind, LinkInfo),
+	    Data = proplists:get_value(data, LinkInfo),
+	    case netlink:linkinfo_dec(Family, Kind, Data) of
+		LI when is_list(LI) ->
+		    {IfIdx, proplists:get_value(vrf_table, LI, main)};
+		_ ->
+		    lager:error("invalid VRF definition ~p", [VRF]),
+		    {undefined, main}
+	    end;
+	_ ->
+	    lager:error("invalid VRF definition ~p", [VRF]),
+	    {undefined, main}
+    end;
+get_interface_rt_table(_Socket, undefined) ->
+    {undefined, main}.
+
+set_vrf(Socket, IfIdx, VRF) when is_integer(VRF) ->
+    Seq = erlang:unique_integer([positive]),
+    Msg = {unspec, arphrd_netrom, IfIdx, [], [],[{master, VRF}]},
+    Req = #rtnetlink{type  = newlink,
+		     flags = [ack,request],
+		     seq   = Seq,
+		     pid   = 0,
+		     msg   = Msg},
+    nl_simple_request(Socket, ?NETLINK_ROUTE, Req);
+set_vrf(_Socket, _IfIdx, _) ->
+    ok.
+
+add_route(Socket, IfIdx, Table, {{_,_,_,_} = IP, Len}) ->
+    Seq = erlang:unique_integer([positive]),
+    Msg = {inet, Len, 0, 0, Table, static, universe, unicast, [],
 	   [{dst,IP}, {oif,IfIdx}]},
     Req = #rtnetlink{type  = newroute,
 		     flags = [create,ack,request],
 		     seq   = Seq,
 		     pid   = 0,
 		     msg   = Msg},
-    nl_simple_request(Socket, ?NETLINK_ROUTE, Req).
+    case nl_simple_request(Socket, ?NETLINK_ROUTE, Req) of
+	#rtnetlink{type = newroute} ->
+	    ok;
+	Other ->
+	    Other
+    end.
+
+configure_vrf(RtNlNs, Device, VrfOpts) ->
+    {ok, GtpIfIdx} = wait_for_interface(RtNlNs, Device),
+
+    Routes = proplists:get_value(routes, VrfOpts, []),
+    VRF = proplists:get_value(netdev, VrfOpts),
+
+    {VrfIdx, VrfTable} = get_interface_rt_table(RtNlNs, VRF),
+    ok = set_vrf(RtNlNs, GtpIfIdx, VrfIdx),
+    lists:foreach(fun(R) -> ok = add_route(RtNlNs, GtpIfIdx, VrfTable, R) end, Routes),
+
+    GtpIfIdx.
 
 nl_simple_response(error, {0, _}, _Response) ->
     ok;
