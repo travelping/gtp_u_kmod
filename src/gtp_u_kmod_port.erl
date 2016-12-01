@@ -228,6 +228,23 @@ handle_msg_1(Socket, IP, Port,
 
     {noreply, State};
 
+handle_msg_1(Socket, IP, Port,
+	     #gtp{version = v1, type = g_pdu, tei = TEI, seq_no = _SeqNo},
+	     State)
+  when is_integer(TEI), TEI /= 0 ->
+    lager:error("g_pdu from ~p:~w, TEI: ~w, SeqNo: ~w", [IP, Port, TEI, _SeqNo]),
+
+    ResponseIEs = [#tunnel_endpoint_identifier_data_i{tei = TEI},
+		   #gsn_address{address = ip2bin(IP)}],
+    ExtHdr = [{udp_port, Port}],
+    Response = #gtp{version = v1, type = error_indication, tei = 0,
+		    seq_no = 0, ext_hdr = ExtHdr, ie = ResponseIEs},
+    Data = gtp_packet:encode(Response),
+    R = gen_socket:sendto(Socket, {inet4, IP, Port}, Data),
+    lager:debug("Error Indication Send Result: ~p", [R]),
+
+    {noreply, State};
+
 handle_msg_1(_Socket, IP, Port,
 	     #gtp{version = v1, type = Type, tei = TEI, seq_no = SeqNo} = _Msg,
 	     State) ->
@@ -236,3 +253,19 @@ handle_msg_1(_Socket, IP, Port,
 
 handle_msg_1(_Socket, _IP, _Port, _Msg, State) ->
     {noreply, State}.
+
+%%====================================================================
+%% IP helpers
+%%====================================================================
+
+ip2bin(IP) when is_binary(IP) ->
+    IP;
+ip2bin({A, B, C, D}) ->
+    <<A, B, C, D>>;
+ip2bin({A, B, C, D, E, F, G, H}) ->
+    <<A:16, B:16, C:16, D:16, E:16, F:16, G:16, H:16>>.
+
+%% bin2ip(<<A, B, C, D>>) ->
+%%     {A, B, C, D};
+%% bin2ip(<<A:16, B:16, C:16, D:16, E:16, F:16, G:16, H:16>>) ->
+%%     {A, B, C, D, E, F, G, H}.
