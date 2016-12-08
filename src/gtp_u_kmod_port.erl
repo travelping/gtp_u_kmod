@@ -55,7 +55,7 @@ port_reg_name(Name) when is_atom(Name) ->
     binary_to_atom(BinName, latin1).
 
 send(Pid, IP, Data) ->
-    gen_server:cast(Pid, {send, IP, Data}).
+    gen_server:cast(Pid, {send, IP, ?GTP1u_PORT, Data}).
 
 bind(Name) ->
     lager:info("RegName: ~p", [port_reg_name(Name)]),
@@ -119,8 +119,8 @@ handle_call(_Request, _From, State) ->
     Reply = ok,
     {reply, Reply, State}.
 
-handle_cast({send, IP, Data}, #state{gtp1u = GTP1u} = State) ->
-    R = gen_socket:sendto(GTP1u, {inet4, IP, ?GTP1u_PORT}, Data),
+handle_cast({send, IP, Port, Data}, #state{gtp1u = GTP1u} = State) ->
+    R = gen_socket:sendto(GTP1u, {inet4, IP, Port}, Data),
     lager:debug("Send Result: ~p", [R]),
     {noreply, State};
 
