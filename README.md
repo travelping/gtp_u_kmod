@@ -30,14 +30,14 @@ Sample config for use with erGW with two VRF-Lite instances (grx and upstream):
 
 ```
 [{gtp_u_kmod, [
-	{sockets, [{grx, [{ip, {192,0,2,16}},
-			   {netdev, "grx"},
-			   freebind,
-			   {vrf, [{routes, [{{10, 180, 0, 0}, 16}]},
-					  {netdev, "upstream"}
-					 ]}
-			  ]}
-	]}
+        {sockets, [{grx, [{ip, {192,0,2,16}},
+                          {netdev, "grx"},
+                          freebind,
+                          {vrf, [{routes, [{{10, 180, 0, 0}, 16}]},
+                                 {netdev, "upstream"}
+                                ]}
+                         ]}
+        ]}
 ]}].
 ```
 

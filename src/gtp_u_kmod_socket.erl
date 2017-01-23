@@ -1,4 +1,4 @@
-%% Copyright 2016, Travelping GmbH <info@travelping.com>
+%% Copyright 2016, 2017, Travelping GmbH <info@travelping.com>
 
 %% This program is free software; you can redistribute it and/or
 %% modify it under the terms of the GNU General Public License
@@ -24,7 +24,7 @@
 -include("include/gtp_u_kmod.hrl").
 
 %% API
--export([start_sockets/0, start_link/1, port_reg_name/1, send/3, bind/1]).
+-export([start_socket/2, start_link/2, port_reg_name/1, send/3, bind/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -38,14 +38,10 @@
 %%% API
 %%%===================================================================
 
-start_sockets() ->
-    {ok, Sockets} = application:get_env(sockets),
-    lists:foreach(fun(Socket) ->
-			  gtp_u_kmod_socket_sup:new(Socket)
-		  end, Sockets),
-    ok.
+start_socket(Name, Options) ->
+    gtp_u_kmod_socket_sup:new(Name, Options).
 
-start_link({Name, SocketOpts}) ->
+start_link(Name, SocketOpts) ->
     RegName = port_reg_name(Name),
     lager:info("RegName: ~p", [RegName]),
     gen_server:start_link({local, RegName}, ?MODULE, [Name, SocketOpts], []).

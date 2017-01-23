@@ -21,10 +21,9 @@
 
 start(_StartType, _StartArgs) ->
     do([error_m ||
-%%	   gtp_config:init(),
 	   Pid <- gtp_u_kmod_app_sup:start_link(),
-	   gtp_u_kmod_socket:start_sockets(),
-           return(Pid)
+	   gtp_u_kmod_config:load_config(setup:get_all_env(gtp_u_kmod)),
+	   return(Pid)
        ]).
 
 stop(_State) ->
