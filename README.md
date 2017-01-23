@@ -4,6 +4,8 @@ gtp_u_kmod - GTPv1-U Erlang interface process for Kernel Datapath
 
 This is a interface to the Linux kernel GTPv1-U (3GPP TS 29.281) datapath element for the erGW GGSN/PGW project implemented in pure Erlang.
 
+*NOTE*: this branch requires a Kernel with an updated GTP kernel API, see http://marc.info/?l=linux-netdev&m=148517324727046&w=2 for patches. As of Mon Jan 23 16:22:06 CET 2017 those updates have been submitted for review.
+
 BUILDING
 --------
 
@@ -22,7 +24,7 @@ RUNNING
 Requirements:
 
 * Erlang 19.0
-* Linux 4.6 with gtp kernel module
+* Linux 4.11+ with gtp kernel module
 
 GTP-u-KMod is the kernel based GTP-U data path instance for [erGW](https://github.com/travelping/ergw)
 

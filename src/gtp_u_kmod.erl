@@ -12,7 +12,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/0, start_socket/2]).
+-export([start_link/1, start_socket/2, start_vrf/2]).
 
 %% regine_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -25,14 +25,14 @@
 
 -define(SERVER, 'gtp-u').
 
--record(state, {}).
+-record(state, {controller, state, tref, timeout}).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 
-start_link() ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+start_link(Controller) ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [Controller], []).
 
 %%
 %% Initialize a new GTPv1-u socket
@@ -40,15 +40,32 @@ start_link() ->
 start_socket(Name, Options) ->
     gtp_u_kmod_socket:start_socket(Name, Options).
 
+%%
+%% start VRF instance
+%%
+start_vrf(Name, Options) ->
+    gtp_u_kmod_vrf:start_vrf(Name, Options).
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
-init([]) ->
-    {ok, #state{}}.
+init([Controller]) ->
+    State0 = #state{
+		controller = Controller,
+		state = disconnected,
+		tref = undefined,
+		timeout = 10
+	       },
+    State = connect(State0),
+    {ok, State}.
 
-handle_call({bind, Port}, _From, State) ->
-    Reply = gtp_u_kmod_socket:bind(Port),
+handle_call({bind_socket, Socket}, _From, State) ->
+    Reply = gtp_u_kmod_socket:bind(Socket),
+    {reply, Reply, State};
+
+handle_call({bind_vrf, VRF}, _From, State) ->
+    Reply = gtp_u_kmod_socket:bind(VRF),
     {reply, Reply, State};
 
 handle_call(_Request, _From, State) ->
@@ -57,6 +74,18 @@ handle_call(_Request, _From, State) ->
 
 handle_cast(_Cast, State) ->
     {noreply, State}.
+
+handle_info({nodedown, Node}, State0) ->
+    lager:warning("node down: ~p", [Node]),
+
+    State1 = handle_nodedown(State0),
+    State = start_nodedown_timeout(State1),
+    {noreply, State};
+
+handle_info(reconnect, State0) ->
+    lager:warning("trying to reconnect"),
+    State = connect(State0#state{tref = undefined}),
+    {noreply, State};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -70,3 +99,28 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+start_nodedown_timeout(State = #state{tref = undefined, timeout = Timeout}) ->
+    NewTimeout = if Timeout < 3000 -> Timeout * 2;
+		    true           -> Timeout
+		 end,
+    TRef = erlang:send_after(Timeout, self(), reconnect),
+    State#state{tref = TRef, timeout = NewTimeout};
+
+start_nodedown_timeout(State) ->
+    State.
+
+connect(#state{controller = Controller} = State) ->
+    case net_adm:ping(Controller) of
+	pong ->
+	    lager:warning("Controller ~p is up", [Controller]),
+	    erlang:monitor_node(Controller, true),
+
+	    State#state{state = connected, timeout = 10};
+	pang ->
+	    lager:warning("Controller ~p is down", [Controller]),
+	    start_nodedown_timeout(State)
+    end.
+
+handle_nodedown(State) ->
+    State#state{state = disconnected}.

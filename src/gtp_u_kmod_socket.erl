@@ -24,7 +24,7 @@
 -include("include/gtp_u_kmod.hrl").
 
 %% API
--export([start_socket/2, start_link/2, port_reg_name/1, send/3, bind/1]).
+-export([start_socket/2, start_link/2, send/3, bind/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -32,7 +32,7 @@
 
 -define(SERVER, ?MODULE).
 
--record(state, {name, ip, gtp0, gtp1u, gtp_dev}).
+-record(state, {name, ip, gtp1u}).
 
 %%%===================================================================
 %%% API
@@ -42,20 +42,13 @@ start_socket(Name, Options) ->
     gtp_u_kmod_socket_sup:new(Name, Options).
 
 start_link(Name, SocketOpts) ->
-    RegName = port_reg_name(Name),
-    lager:info("RegName: ~p", [RegName]),
-    gen_server:start_link({local, RegName}, ?MODULE, [Name, SocketOpts], []).
-
-port_reg_name(Name) when is_atom(Name) ->
-    BinName = iolist_to_binary(io_lib:format("port_~s", [Name])),
-    binary_to_atom(BinName, latin1).
+    gen_server:start_link({global, Name}, ?MODULE, [Name, SocketOpts], []).
 
 send(Pid, IP, Data) ->
     gen_server:cast(Pid, {send, IP, ?GTP1u_PORT, Data}).
 
 bind(Name) ->
-    lager:info("RegName: ~p", [port_reg_name(Name)]),
-    case erlang:whereis(port_reg_name(Name)) of
+    case erlang:whereis(Name) of
 	Pid when is_pid(Pid) ->
 	    gen_server:call(Pid, bind);
 	_ ->
@@ -71,18 +64,11 @@ init([Name, SocketOpts]) ->
     IP    = proplists:get_value(ip, SocketOpts),
     NetNs = proplists:get_value(netns, SocketOpts),
 
-    {ok, GTP0} = make_gtp_socket(NetNs, IP, ?GTP0_PORT, SocketOpts),
     {ok, GTP1u} = make_gtp_socket(NetNs, IP, ?GTP1u_PORT, SocketOpts),
-
-    FD0 = gen_socket:getfd(GTP0),
     FD1u = gen_socket:getfd(GTP1u),
-    {ok, GTPDev} = gtp_u_kernel:dev_create("gtp0", FD0, FD1u, SocketOpts),
+    ok = gtp_u_kmod_netns:enable_gtp_encap(NetNs, FD1u, 1),
 
-    State = #state{name = Name,
-		   ip = IP,
-		   gtp0 = GTP0,
-		   gtp1u = GTP1u,
-		   gtp_dev = GTPDev},
+    State = #state{name = Name, ip = IP, gtp1u = GTP1u},
     {ok, State}.
 
 handle_call(bind, _From, #state{ip = IP} = State) ->
@@ -90,24 +76,27 @@ handle_call(bind, _From, #state{ip = IP} = State) ->
     {reply, Reply, State};
 
 handle_call({create_pdp_context, PeerIP, LocalTEI, RemoteTEI, Args} = _Request,
-	    _From, #state{gtp_dev = GTPDev} = State) ->
+	    _From, #state{gtp1u = GTP1u} = State) ->
+    lager:info("KMOD GTP1u Create PDP Context Call ~p: ~p", [_From, _Request]),
 
-    lager:info("KMOD Port Create PDP Context Call ~p: ~p", [_From, _Request]),
-    Reply = gtp_u_kernel:create_pdp_context(GTPDev, 1, PeerIP, Args, LocalTEI, RemoteTEI),
+    FD1u = gen_socket:getfd(GTP1u),
+    Reply = gtp_u_kmod_vrf:create_pdp_context(FD1u, PeerIP, LocalTEI, RemoteTEI, Args),
     {reply, Reply, State};
 
 handle_call({update_pdp_context, PeerIP, LocalTEI, RemoteTEI, Args} = _Request,
-	    _From, #state{gtp_dev = GTPDev} = State) ->
+	    _From, #state{gtp1u = GTP1u} = State) ->
+    lager:info("KMOD GTP1u Update PDP Context Call ~p: ~p", [_From, _Request]),
 
-    lager:info("KMOD Port Update PDP Context Call ~p: ~p", [_From, _Request]),
-    Reply = gtp_u_kernel:update_pdp_context(GTPDev, 1, PeerIP, Args, LocalTEI, RemoteTEI),
+    FD1u = gen_socket:getfd(GTP1u),
+    Reply = gtp_u_kmod_vrf:update_pdp_context(FD1u, PeerIP, LocalTEI, RemoteTEI, Args),
     {reply, Reply, State};
 
 handle_call({delete_pdp_context, PeerIP, LocalTEI, RemoteTEI, Args} = _Request,
-	    _From, #state{gtp_dev = GTPDev} = State) ->
+	    _From, #state{gtp1u = GTP1u} = State) ->
+    lager:info("KMOD GTP1u Delete PDP Context Call ~p: ~p", [_From, _Request]),
 
-    lager:info("KMOD Port Delete PDP Context Call ~p: ~p", [_From, _Request]),
-    Reply = gtp_u_kernel:delete_pdp_context(GTPDev, 1, PeerIP, Args, LocalTEI, RemoteTEI),
+    FD1u = gen_socket:getfd(GTP1u),
+    Reply = gtp_u_kmod_vrf:delete_pdp_context(FD1u, PeerIP, LocalTEI, RemoteTEI, Args),
     {reply, Reply, State};
 
 handle_call(_Request, _From, State) ->
@@ -139,6 +128,7 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
 make_gtp_socket(NetNs, {_,_,_,_} = IP, Port, Opts) when is_list(NetNs) ->
     {ok, Socket} = gen_socket:socketat(NetNs, inet, dgram, udp),
     bind_gtp_socket(Socket, IP, Port, Opts);

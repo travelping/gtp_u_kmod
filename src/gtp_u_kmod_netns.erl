@@ -2,14 +2,17 @@
 %% License, v. 2.0. If a copy of the MPL was not distributed with this
 %% file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-%% Copyright 2015, Travelping GmbH <info@travelping.com>
+%% Copyright 2017, Travelping GmbH <info@travelping.com>
 
--module(gtp_u_kernel).
+-module(gtp_u_kmod_netns).
+
+-compile({parse_transform, cut}).
 
 -behavior(gen_server).
 
 %% API
--export([dev_create/4, create_pdp_context/6, update_pdp_context/6, delete_pdp_context/6]).
+-export([start_link/1, create_vrf/2, destroy_vrf/2, enable_gtp_encap/3]).
+-export([create_pdp_context/8, update_pdp_context/7, delete_pdp_context/7]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -18,41 +21,76 @@
 -include_lib("kernel/include/file.hrl").
 -include_lib("gen_netlink/include/netlink.hrl").
 
--record(state, {ns, gtp_nl, rt_nl, rt_nl_ns, gtp_genl_family, gtp_ifidx}).
+-record(state, {ns, gtp_nl, rt_nl, gtp_genl_family}).
 
 %%====================================================================
 %% API
 %%====================================================================
 
--spec dev_create(Device     :: binary() | list(),
-		 FD0        :: non_neg_integer(),
-		 FD1u       :: non_neg_integer(),
-		 Opts       :: [term()]) -> ok | {error, _}.
+start_link(NetNs) ->
+    RegName = netns_reg_name(NetNs),
+    gen_server:start_link({local, RegName}, ?MODULE, [NetNs], []).
 
-dev_create(Device, FD0, FD1u, Opts) ->
-    gen_server:start_link(?MODULE, [Device, FD0, FD1u, Opts], []).
+create_vrf(NetNs, Opts) ->
+    call(NetNs, {create_vrf, Opts}).
 
-create_pdp_context(Server, Version, SGSN, MS, LocalTEI, RemoteTEI) ->
-    gen_server:call(Server, {create_pdp_context, Version, SGSN, MS, LocalTEI, RemoteTEI}).
+destroy_vrf(NetNs, GtpDev) ->
+    case erlang:whereis(netns_reg_name(NetNs)) of
+	Pid when is_pid(Pid) ->
+	    gen_server:cast(Pid, {destroy_vrf, GtpDev});
+	_ ->
+	    ok
+    end.
 
-update_pdp_context(Server, Version, SGSN, MS, LocalTEI, RemoteTEI) ->
-    gen_server:call(Server, {update_pdp_context, Version, SGSN, MS, LocalTEI, RemoteTEI}).
+enable_gtp_encap(NetNs, Socket, Version) ->
+    call(NetNs, {enable_gtp_encap, Socket, Version}).
 
-delete_pdp_context(Server, Version, SGSN, MS, LocalTEI, RemoteTEI) ->
-    gen_server:call(Server, {delete_pdp_context, Version, SGSN, MS, LocalTEI, RemoteTEI}).
+create_pdp_context(NetNs, Version, SGSN, MS, GtpDevice, Socket, LocalTEI, RemoteTEI) ->
+    lager:info("KMOD NetNs Create PDP Context Call ~p: ~p, ~p", [NetNs, GtpDevice, Socket]),
+    call(NetNs, {create_pdp_context, Version, SGSN, MS, GtpDevice, Socket, LocalTEI, RemoteTEI}).
+
+update_pdp_context(NetNs, Version, SGSN, MS, Socket, LocalTEI, RemoteTEI) ->
+    call(NetNs, {update_pdp_context, Version, SGSN, MS, Socket, LocalTEI, RemoteTEI}).
+
+delete_pdp_context(NetNs, Version, SGSN, MS, Socket, LocalTEI, RemoteTEI) ->
+    call(NetNs, {delete_pdp_context, Version, SGSN, MS, Socket, LocalTEI, RemoteTEI}).
+
+with_netns(NetNs, Fun) ->
+    Server =
+	case erlang:whereis(netns_reg_name(NetNs)) of
+	    Pid when is_pid(Pid) ->
+		Pid;
+	    _ ->
+		{ok, Pid} = gtp_u_kmod_netns_sup:new(NetNs),
+		Pid
+	end,
+    Fun(Server).
+
+call(NetNs, Opts) ->
+    with_netns(NetNs, gen_server:call(_, Opts)).
 
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
-init([Device, FD0, FD1u, Opts]) ->
-    VrfOpts = proplists:get_value(vrf, Opts, []),
-    {ok, FDesc} = get_ns_fd(VrfOpts),
+init([NetNs]) ->
+    {ok, FDesc} = get_ns_fd(NetNs),
     #file_descriptor{module = prim_file,
 		     data   = {_Port, NsFd}} = FDesc,
 
-    {RtNl, RtNlNs} = netlink_sockets(VrfOpts),
-    CreateGTPLinkInfo = [{fd0, FD0}, {fd1, FD1u}, {hashsize, 131072}],
+    RtNl = netlink_socket(NetNs),
+
+    {ok, GtpGenlFam} = get_family("gtp"),
+    {ok, GtpNl} = socket(NetNs, netlink, raw, ?NETLINK_GENERIC),
+    ok = gen_socket:bind(GtpNl, netlink:sockaddr_nl(netlink, 0, 0)),
+
+    {ok, #state{ns = NsFd, gtp_nl = GtpNl, rt_nl = RtNl, gtp_genl_family = GtpGenlFam}}.
+
+handle_call({create_vrf, Opts}, _From, #state{ns = NsFd, rt_nl = RtNl} = State) ->
+    HashSize = proplists:get_value(hashsize, Opts, 131072),
+    Device = proplists:get_value(device, Opts),
+
+    CreateGTPLinkInfo = [{hashsize, HashSize}],
     CreateGTPData = netlink:linkinfo_enc(inet, "gtp", CreateGTPLinkInfo),
     CreateGTPMsg = {inet,arphrd_none, 0, [up], [up],
 		    [{net_ns_fd, NsFd},
@@ -67,79 +105,60 @@ init([Device, FD0, FD1u, Opts]) ->
     lager:debug("CreateGTPReq: ~p", [CreateGTPReq]),
 
     ok = nl_simple_request(RtNl, ?NETLINK_ROUTE, CreateGTPReq),
-    GtpIfIdx = configure_vrf(RtNlNs, Device, VrfOpts),
+    GtpDevice = configure_vrf(Device, Opts, State),
+    {reply, {ok, GtpDevice}, State};
 
-    {ok, GtpGenlFam} = get_family("gtp"),
-    {ok, GtpNl} = gen_socket:socket(netlink, raw, ?NETLINK_GENERIC),
-    ok = gen_socket:bind(GtpNl, netlink:sockaddr_nl(netlink, 0, 0)),
-
-    {ok, #state{ns = NsFd, gtp_nl = GtpNl, rt_nl = RtNl, rt_nl_ns = RtNlNs, gtp_genl_family = GtpGenlFam, gtp_ifidx = GtpIfIdx}}.
-
-handle_call({create_pdp_context, Version, SGSN, MS, LocalTID, RemoteTID},
-	    _From, #state{ns = NsFd, gtp_nl = GtpNl, gtp_genl_family = GtpGenlFam,
-			  gtp_ifidx = GtpIfIdx} = State) ->
-    lager:debug("create_pdp_context: ~w, ~w, ~w, ~w, ~w", [Version, SGSN, MS, LocalTID, RemoteTID]),
-
-    GtpReqAttrs = [{version,      Version},
-		   {net_ns_fd,    NsFd},
-		   {link,         GtpIfIdx},
-		   {sgsn_address, SGSN},
-		   {ms_address,   MS},
-		   {i_tid,        LocalTID},                  %% TODO: GTPv0 TID and FLOW
-		   {o_tid,        RemoteTID}],
-    GtpReq = {new, 0, 0, GtpReqAttrs},
-    Req = #netlink{type  = gtp,
-		   flags = [?NLM_F_EXCL, ack, request],
-		   seq   = erlang:unique_integer([positive]),
-		   pid   = 0,
-		   msg   = GtpReq},
-    lager:debug("create_pdp_context: ~p", [Req]),
-    Reply = nl_simple_request(GtpNl, GtpGenlFam, Req),
+handle_call({enable_gtp_encap, Socket, Version}, _From, State) ->
+    GtpReqAttrs = [{version, Version},
+		   {fd,      Socket}],
+    GtpReq = {enable_socket, 0, 0, GtpReqAttrs},
+    Reply = gtp_request(GtpReq, ?NLM_F_EXCL, State),
 
     {reply, Reply, State};
 
-handle_call({update_pdp_context, Version, SGSN, MS, LocalTID, RemoteTID},
-	    _From, #state{ns = NsFd, gtp_nl = GtpNl, gtp_genl_family = GtpGenlFam,
-			  gtp_ifidx = GtpIfIdx} = State) ->
-    lager:debug("update_pdp_context: ~w, ~w, ~w, ~w, ~w", [Version, SGSN, MS, LocalTID, RemoteTID]),
+handle_call({create_pdp_context, Version, SGSN, MS, GtpDevice, Socket, LocalTID, RemoteTID},
+	    _From, #state{ns = NsFd} = State) ->
+    lager:debug("create_pdp_context: ~w, ~w, ~w, ~w, ~w, ~w, ~w",
+		[Version, SGSN, MS, GtpDevice, Socket, LocalTID, RemoteTID]),
 
     GtpReqAttrs = [{version,      Version},
 		   {net_ns_fd,    NsFd},
-		   {link,         GtpIfIdx},
+		   {link,         GtpDevice},
 		   {sgsn_address, SGSN},
 		   {ms_address,   MS},
 		   {i_tid,        LocalTID},                  %% TODO: GTPv0 TID and FLOW
-		   {o_tid,        RemoteTID}],
+		   {o_tid,        RemoteTID},
+		   {fd,           Socket}],
     GtpReq = {new, 0, 0, GtpReqAttrs},
-    Req = #netlink{type  = gtp,
-		   flags = [?NLM_F_REPLACE, ack, request],
-		   seq   = erlang:unique_integer([positive]),
-		   pid   = 0,
-		   msg   = GtpReq},
-    lager:debug("update_pdp_context: ~p", [Req]),
-    Reply = nl_simple_request(GtpNl, GtpGenlFam, Req),
+    Reply = gtp_request(GtpReq, ?NLM_F_EXCL, State),
 
     {reply, Reply, State};
 
-handle_call({delete_pdp_context, Version, SGSN, MS, LocalTID, _RemoteTID},
-	    _From, #state{ns = NsFd, gtp_nl = GtpNl, gtp_genl_family = GtpGenlFam,
-			  gtp_ifidx = GtpIfIdx} = State) ->
-    lager:debug("delete_pdp_context: ~w, ~w, ~w, ~w, ~w", [Version, SGSN, MS, LocalTID, _RemoteTID]),
+handle_call({update_pdp_context, Version, SGSN, MS, Socket, LocalTID, RemoteTID},
+	    _From, State) ->
+    lager:debug("update_pdp_context: ~w, ~w, ~w, ~w, ~w",
+		[Version, SGSN, MS, Socket, LocalTID, RemoteTID]),
 
     GtpReqAttrs = [{version,      Version},
-		   {net_ns_fd,    NsFd},
-		   {link,         GtpIfIdx},
 		   {sgsn_address, SGSN},
 		   {ms_address,   MS},
-		   {i_tid,        LocalTID}],                  %% TODO: GTPv0 TID and FLOW
+		   {i_tid,        LocalTID},                  %% TODO: GTPv0 TID and FLOW
+		   {o_tid,        RemoteTID},
+		   {fd,           Socket}],
+    GtpReq = {new, 0, 0, GtpReqAttrs},
+    Reply = gtp_request(GtpReq, ?NLM_F_REPLACE, State),
+
+    {reply, Reply, State};
+
+handle_call({delete_pdp_context, Version, SGSN, MS, Socket, LocalTID, _RemoteTID},
+	    _From, State) ->
+    lager:debug("delete_pdp_context: ~w, ~w, ~w, ~w, ~w, ~w", [Version, SGSN, MS, Socket, LocalTID, _RemoteTID]),
+
+    GtpReqAttrs = [{version,      Version},
+		   {i_tid,        LocalTID},
+		   {fd,           Socket}],                  %% TODO: GTPv0 TID and FLOW
     GtpReq = {delete, 0, 0, GtpReqAttrs},
-    Req = #netlink{type  = gtp,
-		   flags = [?NLM_F_EXCL, ack, request],
-		   seq   = erlang:unique_integer([positive]),
-		   pid   = 0,
-		   msg   = GtpReq},
-    lager:debug("delete_pdp_context: ~p", [Req]),
-    Reply = nl_simple_request(GtpNl, GtpGenlFam, Req),
+    Reply = gtp_request(GtpReq, ?NLM_F_EXCL, State),
 
     {reply, Reply, State};
 
@@ -147,6 +166,17 @@ handle_call(Request, _From, State) ->
     lager:warning("handle_call: ~p", [lager:pr(Request, ?MODULE)]),
     {reply, ok, State}.
 
+handle_cast({destroy_vrf, GtpDev}, #state{rt_nl = RtNl} = State) ->
+    DestroyGTPMsg = {inet,arphrd_none, GtpDev, [up], [up], []},
+    DestroyGTPReq = #rtnetlink{type  = dellink,
+			       flags = [destroy,excl,ack,request],
+			       seq   = erlang:unique_integer([positive]),
+			       pid   = 0,
+			       msg   = DestroyGTPMsg},
+    lager:debug("DestroyGTPReq: ~p", [DestroyGTPReq]),
+
+    ok = nl_simple_request(RtNl, ?NETLINK_ROUTE, DestroyGTPReq),
+    {noreply, State};
 handle_cast(Msg, State) ->
     lager:debug("handle_cast: ~p", [lager:pr(Msg, ?MODULE)]),
     {noreply, State}.
@@ -165,17 +195,22 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%--------------------------------------------------------------------
 
+netns_reg_name(Name) when is_atom(Name) ->
+    BinName = iolist_to_binary(io_lib:format("netns_~s", [Name])),
+    binary_to_atom(BinName, latin1).
+
 -define(SELF_NET_NS, "/proc/self/ns/net").
 -define(SIOCGIFINDEX, 16#8933).
 
-get_ns_fd(Opts) ->
+get_ns_fd(NetNs) when is_list(NetNs) ->
     try
-	{netns, NetNs} = lists:keyfind(netns, 1, Opts),
 	{ok, _} = file:open(filename:join("/var/run/netns", NetNs), [raw, read])
     catch
 	_:_ ->
 	    {ok, _} = file:open(?SELF_NET_NS, [raw, read])
-    end.
+    end;
+get_ns_fd(_NetNs) ->
+    {ok, _} = file:open(?SELF_NET_NS, [raw, read]).
 
 %% get_ifindex(Name, Opts) when is_list(Name) ->
 %%     get_ifindex(iolist_to_binary(Name), Opts);
@@ -185,30 +220,16 @@ get_ns_fd(Opts) ->
 %%     gen_socket:close(S),
 %%     Index.
 
-%% raw_socket(Family, Type, Protocol, Opts) ->
-%%     case proplists:get_value(netns, Opts) of
-%%         undefined ->
-%%             gen_socket:raw_socket(Family, Type, Protocol);
-%%         NetNs ->
-%%             gen_socket:raw_socketat(NetNs, Family, Type, Protocol)
-%%     end.
+socket(NetNs, Family, Type, Protocol) when is_list(NetNs) ->
+    gen_socket:socketat(NetNs, Family, Type, Protocol);
+socket(_NetNs, Family, Type, Protocol) ->
+    gen_socket:socket(Family, Type, Protocol).
 
-netlink_sockets(Opts) ->
-    {ok, RtNl} = gen_socket:socket(netlink, raw, ?NETLINK_ROUTE),
-    ok = gen_socket:bind(RtNl, netlink:sockaddr_nl(netlink, 0, -1)),
-
-    RtNlNs =
-	case proplists:get_value(netns, Opts) of
-	    undefined ->
-		RtNl;
-	    NetNs ->
-		{ok, RtNlNs1} = gen_socket:socketat(NetNs, netlink, raw, ?NETLINK_ROUTE),
-		ok = gen_socket:bind(RtNlNs1, netlink:sockaddr_nl(netlink, 0, -1)),
-		ok = netlink:setsockopt(RtNlNs1, sol_netlink, netlink_add_membership, rtnlgrp_link),
-		RtNlNs1
-	end,
-    ok = netlink:setsockopt(RtNlNs, sol_netlink, netlink_add_membership, rtnlgrp_link),
-    {RtNl, RtNlNs}.
+netlink_socket(NetNs) ->
+    {ok, S} = socket(NetNs, netlink, raw, ?NETLINK_ROUTE),
+    ok = gen_socket:bind(S, netlink:sockaddr_nl(netlink, 0, -1)),
+    ok = netlink:setsockopt(S, sol_netlink, netlink_add_membership, rtnlgrp_link),
+    S.
 
 get_family(Family) ->
     {ok, S} = gen_socket:socket(netlink, raw, ?NETLINK_GENERIC),
@@ -233,21 +254,21 @@ get_family(Family) ->
     gen_socket:close(S),
     Return.
 
-wait_for_interface(Socket, Device) ->
+wait_for_interface(Device) ->
     receive
 	#rtnetlink{type = newlink, msg = {_, _, Index, _, _, Attrs}} ->
 	    case lists:keyfind(ifname, 1, Attrs) of
 		{_, Device} ->
 		    {ok, Index};
 		_Other ->
-		    wait_for_interface(Socket, Device)
+		    wait_for_interface(Device)
 	    end
     after
 	5000 ->
 	    {error, timeout}
     end.
 
-get_interface_rt_table(Socket, VRF) when is_list(VRF) ->
+get_interface_rt_table(VRF, #state{rt_nl = RtNl}) when is_list(VRF) ->
     Seq = erlang:unique_integer([positive]),
     Msg = {unspec, arphrd_netrom, 0, [], [], [{ifname, VRF}]},
     Req = #rtnetlink{type  = getlink,
@@ -255,7 +276,7 @@ get_interface_rt_table(Socket, VRF) when is_list(VRF) ->
 		     seq   = Seq,
 		     pid   = 0,
 		     msg   = Msg},
-    case nl_simple_request(Socket, ?NETLINK_ROUTE, Req) of
+    case nl_simple_request(RtNl, ?NETLINK_ROUTE, Req) of
 	 #rtnetlink{type  = newlink, msg = {Family, _, IfIdx, _, _, Attrs}} ->
 	    LinkInfo = proplists:get_value(linkinfo, Attrs, []),
 	    Kind = proplists:get_value(kind, LinkInfo),
@@ -271,10 +292,10 @@ get_interface_rt_table(Socket, VRF) when is_list(VRF) ->
 	    lager:error("invalid VRF definition ~p", [VRF]),
 	    {undefined, main}
     end;
-get_interface_rt_table(_Socket, undefined) ->
+get_interface_rt_table(undefined, _State) ->
     {undefined, main}.
 
-set_vrf(Socket, IfIdx, VRF) when is_integer(VRF) ->
+set_vrf(IfIdx, VRF, #state{rt_nl = RtNl}) when is_integer(VRF) ->
     Seq = erlang:unique_integer([positive]),
     Msg = {unspec, arphrd_netrom, IfIdx, [], [],[{master, VRF}]},
     Req = #rtnetlink{type  = newlink,
@@ -282,11 +303,11 @@ set_vrf(Socket, IfIdx, VRF) when is_integer(VRF) ->
 		     seq   = Seq,
 		     pid   = 0,
 		     msg   = Msg},
-    nl_simple_request(Socket, ?NETLINK_ROUTE, Req);
-set_vrf(_Socket, _IfIdx, _) ->
+    nl_simple_request(RtNl, ?NETLINK_ROUTE, Req);
+set_vrf(_IfIdx, _, _State) ->
     ok.
 
-add_route(Socket, IfIdx, Table, {{_,_,_,_} = IP, Len}) ->
+add_route(IfIdx, Table, {{_,_,_,_} = IP, Len}, #state{rt_nl = RtNl}) ->
     Seq = erlang:unique_integer([positive]),
     Msg = {inet, Len, 0, 0, Table, static, universe, unicast, [],
 	   [{dst,IP}, {oif,IfIdx}]},
@@ -295,24 +316,33 @@ add_route(Socket, IfIdx, Table, {{_,_,_,_} = IP, Len}) ->
 		     seq   = Seq,
 		     pid   = 0,
 		     msg   = Msg},
-    case nl_simple_request(Socket, ?NETLINK_ROUTE, Req) of
+    case nl_simple_request(RtNl, ?NETLINK_ROUTE, Req) of
 	#rtnetlink{type = newroute} ->
 	    ok;
 	Other ->
 	    Other
     end.
 
-configure_vrf(RtNlNs, Device, VrfOpts) ->
-    {ok, GtpIfIdx} = wait_for_interface(RtNlNs, Device),
+configure_vrf(Device, Opts, State) ->
+    {ok, GtpIfIdx} = wait_for_interface(Device),
 
-    Routes = proplists:get_value(routes, VrfOpts, []),
-    VRF = proplists:get_value(netdev, VrfOpts),
+    Routes = proplists:get_value(routes, Opts, []),
+    VRF = proplists:get_value(netdev, Opts),
 
-    {VrfIdx, VrfTable} = get_interface_rt_table(RtNlNs, VRF),
-    ok = set_vrf(RtNlNs, GtpIfIdx, VrfIdx),
-    lists:foreach(fun(R) -> ok = add_route(RtNlNs, GtpIfIdx, VrfTable, R) end, Routes),
+    {VrfIdx, VrfTable} = get_interface_rt_table(VRF, State),
+    ok = set_vrf(GtpIfIdx, VrfIdx, State),
+    lists:foreach(fun(R) -> ok = add_route(GtpIfIdx, VrfTable, R, State) end, Routes),
 
     GtpIfIdx.
+
+gtp_request(Request, Flag, #state{gtp_nl = GtpNl, gtp_genl_family = GtpGenlFam}) ->
+    Req = #netlink{type  = gtp,
+		   flags = [Flag, ack, request],
+		   seq   = erlang:unique_integer([positive]),
+		   pid   = 0,
+		   msg   = Request},
+    lager:debug("GTP request: ~p", [Req]),
+    nl_simple_request(GtpNl, GtpGenlFam, Req).
 
 nl_simple_response(error, {0, _}, _Response) ->
     ok;
