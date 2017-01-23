@@ -30,6 +30,6 @@ start_link() ->
 %% ===================================================================
 
 init([]) ->
-    {ok, {{one_for_one, 5, 10}, [?CHILD(gtp_u_kmod_port_sup, supervisor, []),
+    {ok, {{one_for_one, 5, 10}, [?CHILD(gtp_u_kmod_socket_sup, supervisor, []),
 				 ?CHILD(gtp_u_kmod, worker, [])
 				]} }.

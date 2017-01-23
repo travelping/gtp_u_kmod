@@ -5,7 +5,7 @@
 %% as published by the Free Software Foundation; either version
 %% 2 of the License, or (at your option) any later version.
 
--module(gtp_u_kmod_port).
+-module(gtp_u_kmod_socket).
 
 %% A GTP-U proxy instance is described by
 %%  * GRX IP and sending port
@@ -41,7 +41,7 @@
 start_sockets() ->
     {ok, Sockets} = application:get_env(sockets),
     lists:foreach(fun(Socket) ->
-			  gtp_u_kmod_port_sup:new(Socket)
+			  gtp_u_kmod_socket_sup:new(Socket)
 		  end, Sockets),
     ok.
 

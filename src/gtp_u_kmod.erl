@@ -42,7 +42,7 @@ init([]) ->
     {ok, #state{}}.
 
 handle_call({bind, Port}, _From, State) ->
-    Reply = gtp_u_kmod_port:bind(Port),
+    Reply = gtp_u_kmod_socket:bind(Port),
     {reply, Reply, State};
 
 handle_call(_Request, _From, State) ->

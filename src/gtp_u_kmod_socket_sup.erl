@@ -5,7 +5,7 @@
 %% as published by the Free Software Foundation; either version
 %% 2 of the License, or (at your option) any later version.
 
--module(gtp_u_kmod_port_sup).
+-module(gtp_u_kmod_socket_sup).
 
 -behaviour(supervisor).
 
@@ -33,4 +33,4 @@ new(Socket) ->
 
 init([]) ->
     {ok, {{simple_one_for_one, 5, 10},
-	  [{gtp_u_kmod_port, {gtp_u_kmod_port, start_link, []}, temporary, 1000, worker, [gtp_u_kmod_port]}]}}.
+	  [{gtp_u_kmod_socket, {gtp_u_kmod_socket, start_link, []}, temporary, 1000, worker, [gtp_u_kmod_socket]}]}}.
