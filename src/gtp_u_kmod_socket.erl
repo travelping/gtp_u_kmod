@@ -105,7 +105,7 @@ handle_call(_Request, _From, State) ->
     {reply, Reply, State}.
 
 handle_cast({send, IP, Port, Data}, #state{gtp1u = GTP1u} = State) ->
-    R = gen_socket:sendto(GTP1u, {inet4, IP, Port}, Data),
+    R = sendto(GTP1u, IP, Port, Data),
     lager:debug("Send Result: ~p", [R]),
     {noreply, State};
 
@@ -129,11 +129,14 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-make_gtp_socket(NetNs, {_,_,_,_} = IP, Port, Opts) when is_list(NetNs) ->
-    {ok, Socket} = gen_socket:socketat(NetNs, inet, dgram, udp),
+family({_,_,_,_}) -> inet;
+family({_,_,_,_,_,_,_,_}) -> inet6.
+
+make_gtp_socket(NetNs, IP, Port, Opts) when is_list(NetNs) ->
+    {ok, Socket} = gen_socket:socketat(NetNs, family(IP), dgram, udp),
     bind_gtp_socket(Socket, IP, Port, Opts);
-make_gtp_socket(_NetNs, {_,_,_,_} = IP, Port, Opts) ->
-    {ok, Socket} = gen_socket:socket(inet, dgram, udp),
+make_gtp_socket(_NetNs, IP, Port, Opts) ->
+    {ok, Socket} = gen_socket:socket(family(IP), dgram, udp),
     bind_gtp_socket(Socket, IP, Port, Opts).
 
 bind_gtp_socket(Socket, {_,_,_,_} = IP, Port, Opts) ->
@@ -147,6 +150,13 @@ bind_gtp_socket(Socket, {_,_,_,_} = IP, Port, Opts) ->
     ok = gen_socket:bind(Socket, {inet4, IP, Port}),
     ok = gen_socket:setsockopt(Socket, sol_ip, recverr, true),
     ok = gen_socket:input_event(Socket, true),
+    {ok, Socket};
+
+bind_gtp_socket(Socket, {_,_,_,_,_,_,_,_} = IP, Port, Opts) ->
+    %% ok = gen_socket:setsockopt(Socket, sol_ip, recverr, true),
+    ok = gen_socket:bind(Socket, {inet6, IP, Port}),
+    lists:foreach(socket_setopts(Socket, _), Opts),
+    ok = gen_socket:input_event(Socket, true),
     {ok, Socket}.
 
 socket_setopts(Socket, {netdev, Device})
@@ -156,12 +166,17 @@ socket_setopts(Socket, {netdev, Device})
 socket_setopts(_Socket, _) ->
     ok.
 
+sendto(Socket, {_,_,_,_} = IP, Port, Data) ->
+    gen_socket:sendto(Socket, {inet4, IP, Port}, Data);
+sendto(Socket, {_,_,_,_,_,_,_,_} = IP, Port, Data) ->
+    gen_socket:sendto(Socket, {inet6, IP, Port}, Data).
+
 handle_input(Socket, State) ->
     case gen_socket:recvfrom(Socket) of
 	{error, _} ->
 	    handle_err_input(Socket, State);
 
-	{ok, {inet4, IP, Port}, Data} ->
+	{ok, {_, IP, Port}, Data} ->
 	    ok = gen_socket:input_event(Socket, true),
 	    handle_msg(Socket, IP, Port, Data, State);
 
@@ -209,7 +224,7 @@ handle_msg_1(Socket, IP, Port,
 
     Response = #gtp{version = v1, type = echo_response, tei = TEI, seq_no = SeqNo, ie = ResponseIEs},
     Data = gtp_packet:encode(Response),
-    R = gen_socket:sendto(Socket, {inet4, IP, Port}, Data),
+    R = sendto(Socket, IP, Port, Data),
     lager:debug("Echo Reply Send Result: ~p", [R]),
 
     {noreply, State};
@@ -226,7 +241,7 @@ handle_msg_1(Socket, IP, Port,
     Response = #gtp{version = v1, type = error_indication, tei = 0,
 		    seq_no = 0, ext_hdr = ExtHdr, ie = ResponseIEs},
     Data = gtp_packet:encode(Response),
-    R = gen_socket:sendto(Socket, {inet4, IP, Port}, Data),
+    R = sendto(Socket, IP, Port, Data),
     lager:debug("Error Indication Send Result: ~p", [R]),
 
     {noreply, State};

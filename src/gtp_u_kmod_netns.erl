@@ -124,7 +124,7 @@ handle_call({create_pdp_context, Version, SGSN, MS, GtpDevice, Socket, LocalTID,
     GtpReqAttrs = [{version,      Version},
 		   {net_ns_fd,    NsFd},
 		   {link,         GtpDevice},
-		   {sgsn_address, SGSN},
+		   nla_gsn_peer_address(SGSN),
 		   {ms_address,   MS},
 		   {i_tid,        LocalTID},                  %% TODO: GTPv0 TID and FLOW
 		   {o_tid,        RemoteTID},
@@ -140,7 +140,7 @@ handle_call({update_pdp_context, Version, SGSN, MS, Socket, LocalTID, RemoteTID}
 		[Version, SGSN, MS, Socket, LocalTID, RemoteTID]),
 
     GtpReqAttrs = [{version,      Version},
-		   {sgsn_address, SGSN},
+		   nla_gsn_peer_address(SGSN),
 		   {ms_address,   MS},
 		   {i_tid,        LocalTID},                  %% TODO: GTPv0 TID and FLOW
 		   {o_tid,        RemoteTID},
@@ -424,3 +424,8 @@ process_nl(_Multi, [Head|Rest], Cb, CbState0) ->
 
 nl(Msg, Acc) ->
     [Msg|Acc].
+
+nla_gsn_peer_address({_,_,_,_,_,_,_,_} = IP) ->
+    {sgsn_address6, IP};
+nla_gsn_peer_address({_,_,_,_} = IP) ->
+    {sgsn_address, IP}.
