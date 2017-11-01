@@ -1,20 +1,16 @@
 gtp_u_kmod - GTPv1-U Erlang interface process for Kernel Datapath
 =================================================================
-[![Build Status](https://travis-ci.org/travelping/gtp_u_kmod.svg?branch=master)](https://travis-ci.org/travelping/gtp_u_kmod)
+[![Build Status][travis badge]][travis]
+[![Erlang Versions][erlang version badge]][travis]
 
 This is a interface to the Linux kernel GTPv1-U (3GPP TS 29.281) datapath element for the erGW GGSN/PGW project implemented in pure Erlang.
 
 BUILDING
 --------
 
-Using tetrapak:
-
-    # tetrapak build check
-
 Using rebar:
 
-    # rebar get-deps
-    # rebar compile
+    # rebar3 compile
 
 RUNNING
 -------
@@ -52,3 +48,9 @@ For GTP sockets the binding is optional, but for the network devices the binding
 ### GTP VRF
 
 A GTP VRF describes a virtual Linux network interface that serves a give client IP range. All traffic is routed into that interface and matches a GTP tunnel is GTP encapsulated and forwarded to a S-GW/SGSN.
+
+
+<!-- Badges -->
+[travis]: https://travis-ci.org/travelping/gtp_u_kmod
+[travis badge]: https://img.shields.io/travis/travelping/gtp_u_kmod/master.svg?style=flat-square
+[erlang version badge]: https://img.shields.io/badge/erlang-R19.3%20to%2020.1-blue.svg?style=flat-square
