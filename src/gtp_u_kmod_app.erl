@@ -7,7 +7,6 @@
 
 -module(gtp_u_kmod_app).
 
--compile({parse_transform, cut}).
 -compile({parse_transform, do}).
 
 -behaviour(application).

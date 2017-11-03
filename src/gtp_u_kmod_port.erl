@@ -17,22 +17,29 @@
 
 -behaviour(gen_server).
 
--compile({parse_transform, cut}).
-
+-include_lib("stdlib/include/ms_transform.hrl").
 -include_lib("gen_socket/include/gen_socket.hrl").
 -include_lib("gtplib/include/gtp_packet.hrl").
 -include("include/gtp_u_kmod.hrl").
 
 %% API
--export([start_sockets/0, start_link/1, port_reg_name/1, send/3, bind/1]).
+-export([start_sockets/0, start_link/1, port_reg_name/1, send/3, bind/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
 	 terminate/2, code_change/3]).
 
+-ifdef(TEST).
+%% Test API
+-export([lookup/2, all/1]).
+-endif.
+
 -define(SERVER, ?MODULE).
 
--record(state, {name, ip, gtp0, gtp1u, gtp_dev}).
+-record(state, {name, ip, owner, gtp0, gtp1u, gtp_dev, tid}).
+-record(tunnel, {seid, local_teid, peer_ip, peer_teid, ms, far_id}).
+
+-define('Tunnel Endpoint Identifier Data I', {tunnel_endpoint_identifier_data_i, 0}).
 
 %%%===================================================================
 %%% API
@@ -57,14 +64,22 @@ port_reg_name(Name) when is_atom(Name) ->
 send(Pid, IP, Data) ->
     gen_server:cast(Pid, {send, IP, ?GTP1u_PORT, Data}).
 
-bind(Name) ->
+bind(Name, Owner) ->
     lager:info("RegName: ~p", [port_reg_name(Name)]),
     case erlang:whereis(port_reg_name(Name)) of
 	Pid when is_pid(Pid) ->
-	    gen_server:call(Pid, bind);
+	    gen_server:call(Pid, {bind, Owner});
 	_ ->
 	    {reply, {error, not_found}}
     end.
+
+-ifdef(TEST).
+lookup(Pid, SEID) ->
+    gen_server:call(Pid, {lookup, SEID}).
+
+all(Pid) ->
+    gen_server:call(Pid, all).
+-endif.
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -82,37 +97,91 @@ init([Name, SocketOpts]) ->
     FD1u = gen_socket:getfd(GTP1u),
     {ok, GTPDev} = gtp_u_kernel:dev_create("gtp0", FD0, FD1u, SocketOpts),
 
+    TID = ets:new(?SERVER, [ordered_set, {keypos, #tunnel.seid}]),
+
     State = #state{name = Name,
 		   ip = IP,
+		   tid = TID,
 		   gtp0 = GTP0,
 		   gtp1u = GTP1u,
 		   gtp_dev = GTPDev},
     {ok, State}.
 
-handle_call(bind, _From, #state{ip = IP} = State) ->
+handle_call({lookup, SEID}, _From, #state{tid = TID} = State) ->
+    Reply = ets:lookup(TID, SEID),
+    {reply, Reply, State};
+
+handle_call(all, _From, #state{tid = TID} = State) ->
+    Reply = ets:tab2list(TID),
+    {reply, Reply, State};
+
+handle_call({bind, Owner}, _From, #state{ip = IP} = State) ->
     Reply = {ok, self(), IP},
+    {reply, Reply, State#state{owner = Owner}};
+
+handle_call({SEID, session_establishment_request, SER} = _Request,
+	    _From, #state{gtp_dev = GTPDev, tid = TID} = State) ->
+
+    lager:info("KMOD Port Session Establishment Request ~p: ~p", [_From, _Request]),
+
+    Tunnel0 = #tunnel{seid = SEID},
+    Tunnel1 = lists:foldr(fun create_pdr/2, Tunnel0, maps:get(create_pdr, SER, [])),
+    Tunnel = lists:foldr(fun create_far/2, Tunnel1, maps:get(create_far, SER, [])),
+
+    ets:insert_new(TID, Tunnel),
+    #tunnel{local_teid = LocalTEI, peer_ip = PeerIP,
+	    peer_teid = PeerTEI, ms = IPv4} = Tunnel,
+    Reply = gtp_u_kernel:create_pdp_context(GTPDev, 1, PeerIP, IPv4, LocalTEI, PeerTEI),
     {reply, Reply, State};
 
-handle_call({create_pdp_context, PeerIP, LocalTEI, RemoteTEI, Args} = _Request,
-	    _From, #state{gtp_dev = GTPDev} = State) ->
+handle_call({SEID, session_modification_request, SMR} = _Request,
+	    _From, #state{gtp_dev = GTPDev, tid = TID} = State) ->
 
-    lager:info("KMOD Port Create PDP Context Call ~p: ~p", [_From, _Request]),
-    Reply = gtp_u_kernel:create_pdp_context(GTPDev, 1, PeerIP, Args, LocalTEI, RemoteTEI),
+    lager:info("KMOD Port Session Modification Request ~p: ~p", [_From, _Request]),
+    Reply =
+	case ets:take(TID, SEID) of
+	    [#tunnel{local_teid = OldLocalTEI, ms = OldIPv4} = Tunnel0] ->
+		Tunnel1 = lists:foldr(fun update_pdr/2, Tunnel0, maps:get(update_pdr, SMR, [])),
+		Tunnel = lists:foldr(fun update_far/2, Tunnel1, maps:get(update_far, SMR, [])),
+		#tunnel{local_teid = LocalTEI, peer_ip = PeerIP,
+			peer_teid = PeerTEI, ms = IPv4} = Tunnel,
+		Replace = OldLocalTEI /= LocalTEI orelse OldIPv4 /= IPv4,
+		case gtp_u_kernel:update_pdp_context(GTPDev, 1, PeerIP, IPv4, LocalTEI,
+						     PeerTEI, Replace) of
+		    ok ->
+			ets:insert_new(TID, Tunnel),
+			ok;
+		    Other ->
+			%% put old tunnel object back
+			ets:insert_new(TID, Tunnel0),
+			Other
+		end;
+	    _ ->
+		{error, not_found}
+	end,
     {reply, Reply, State};
 
-handle_call({update_pdp_context, PeerIP, LocalTEI, RemoteTEI, Args} = _Request,
-	    _From, #state{gtp_dev = GTPDev} = State) ->
+handle_call({SEID, session_deletion_request, _} = _Request,
+	    _From, #state{gtp_dev = GTPDev, tid = TID} = State) ->
 
-    lager:info("KMOD Port Update PDP Context Call ~p: ~p", [_From, _Request]),
-    Reply = gtp_u_kernel:update_pdp_context(GTPDev, 1, PeerIP, Args, LocalTEI, RemoteTEI),
-    {reply, Reply, State};
+    lager:info("KMOD Session Deletion Request ~p: ~p", [_From, _Request]),
+    case ets:take(TID, SEID) of
+	[#tunnel{local_teid = LocalTEI, peer_ip = PeerIP, peer_teid = PeerTEI, ms = IPv4}] ->
+	    Reply = gtp_u_kernel:delete_pdp_context(GTPDev, 1, PeerIP, IPv4, LocalTEI, PeerTEI),
+	    {reply, Reply, State};
+	_ ->
+	    {reply, {error, not_found}, State}
+    end;
 
-handle_call({delete_pdp_context, PeerIP, LocalTEI, RemoteTEI, Args} = _Request,
-	    _From, #state{gtp_dev = GTPDev} = State) ->
-
-    lager:info("KMOD Port Delete PDP Context Call ~p: ~p", [_From, _Request]),
-    Reply = gtp_u_kernel:delete_pdp_context(GTPDev, 1, PeerIP, Args, LocalTEI, RemoteTEI),
-    {reply, Reply, State};
+handle_call(clear, _From, #state{gtp_dev = GTPDev, tid = TID} = State) ->
+    lager:info("KMOD clear request"),
+    ets:foldl(fun(#tunnel{local_teid = LocalTEI, peer_ip = PeerIP,
+			  peer_teid = PeerTEI, ms = IPv4}, _) ->
+		      gtp_u_kernel:delete_pdp_context(GTPDev, 1, PeerIP, IPv4,
+						      LocalTEI, PeerTEI),
+		      ok end, ok, TID),
+    ets:delete_all_objects(TID),
+    {reply, ok, State};
 
 handle_call(_Request, _From, State) ->
     lager:info("KMOD Port Call ~p: ~p", [_From, _Request]),
@@ -157,7 +226,7 @@ bind_gtp_socket(Socket, {_,_,_,_} = IP, Port, Opts) ->
 	_ ->
 	    ok
     end,
-    lists:foreach(socket_setopts(Socket, _), Opts),
+    lists:foreach(fun(Opt) -> socket_setopts(Socket, Opt) end, Opts),
     ok = gen_socket:bind(Socket, {inet4, IP, Port}),
     ok = gen_socket:setsockopt(Socket, sol_ip, recverr, true),
     ok = gen_socket:input_event(Socket, true),
@@ -245,6 +314,10 @@ handle_msg_1(Socket, IP, Port,
 
     {noreply, State};
 
+handle_msg_1(_Socket, IP, _Port, #gtp{type = error_indication} = Msg, State) ->
+    error_indication_report(IP, Msg, State),
+    {noreply, State};
+
 handle_msg_1(_Socket, IP, Port,
 	     #gtp{version = v1, type = Type, tei = TEI, seq_no = SeqNo} = _Msg,
 	     State) ->
@@ -253,6 +326,33 @@ handle_msg_1(_Socket, IP, Port,
 
 handle_msg_1(_Socket, _IP, _Port, _Msg, State) ->
     {noreply, State}.
+
+error_indication_report(IP,
+			#gtp{ie =
+				 #{{gsn_address,0} :=
+				       #gsn_address{address = PeerIP},
+				   ?'Tunnel Endpoint Identifier Data I' :=
+				       #tunnel_endpoint_identifier_data_i{tei = PeerTEI}}
+			    },
+			#state{owner = Owner, tid = TID})
+  when is_pid(Owner) ->
+    MS = #tunnel{seid = '$1', local_teid = '_',
+		 peer_ip = bin2ip(PeerIP), peer_teid = PeerTEI,
+		 ms = '_', far_id = '_'},
+    case ets:match(TID, MS) of
+	[[SEID]] ->
+	    FTEID = #f_teid{ipv4 = IP, teid = PeerTEI},
+	    SRR = #{
+	      report_type => [error_indication_report],
+	      error_indication_report =>
+		  [#{remote_f_teid => FTEID}]
+	     },
+	    Owner ! {SEID, session_report_request, SRR};
+	_ ->
+	    ok
+    end;
+error_indication_report(_IP, _Msg, _State) ->
+    ok.
 
 %%====================================================================
 %% IP helpers
@@ -265,7 +365,74 @@ ip2bin({A, B, C, D}) ->
 ip2bin({A, B, C, D, E, F, G, H}) ->
     <<A:16, B:16, C:16, D:16, E:16, F:16, G:16, H:16>>.
 
-%% bin2ip(<<A, B, C, D>>) ->
-%%     {A, B, C, D};
-%% bin2ip(<<A:16, B:16, C:16, D:16, E:16, F:16, G:16, H:16>>) ->
-%%     {A, B, C, D, E, F, G, H}.
+bin2ip(<<A, B, C, D>>) ->
+    {A, B, C, D};
+bin2ip(<<A:16, B:16, C:16, D:16, E:16, F:16, G:16, H:16>>) ->
+    {A, B, C, D, E, F, G, H}.
+
+%%====================================================================
+%% Sx DP API helpers
+%%====================================================================
+
+create_pdr(#{pdi := #{
+	       local_f_teid := #f_teid{teid = LocalTEI}
+	      },
+	     outer_header_removal := true
+	    }, Tunnel) ->
+    Tunnel#tunnel{
+      local_teid = LocalTEI
+     };
+create_pdr(#{pdi := #{
+	       ue_ip_address := {dst, IPv4}
+	      },
+	     outer_header_removal := false,
+	     far_id := FarId}, Tunnel) ->
+    Tunnel#tunnel{
+      far_id = FarId,
+      ms = IPv4
+     }.
+
+create_far(#{far_id := FarId,
+	     apply_action := [forward],
+	     forwarding_parameters := #{
+	       outer_header_creation :=
+		   #f_teid{
+		      ipv4 = PeerIP,
+		      teid = PeerTEI
+		     }
+	      }
+	    }, #tunnel{far_id = FarId} = Tunnel) ->
+    Tunnel#tunnel{
+      peer_ip = PeerIP,
+      peer_teid = PeerTEI
+     };
+create_far(_, Tunnel) ->
+    Tunnel.
+
+update_pdr(#{pdi := #{
+	       local_f_teid := #f_teid{teid = LocalTEI}
+	      },
+	     outer_header_removal := true
+	    }, Tunnel) ->
+    Tunnel#tunnel{
+      local_teid = LocalTEI
+     };
+update_pdr(_, Tunnel) ->
+    Tunnel.
+
+update_far(#{far_id := FarId,
+	     apply_action := [forward],
+	     update_forwarding_parameters := #{
+	       outer_header_creation :=
+		   #f_teid{
+		      ipv4 = PeerIP,
+		      teid = PeerTEI
+		     }
+	      }
+	    }, #tunnel{far_id = FarId} = Tunnel) ->
+    Tunnel#tunnel{
+      peer_ip = PeerIP,
+      peer_teid = PeerTEI
+     };
+update_far(_, Tunnel) ->
+    Tunnel.

@@ -7,8 +7,6 @@
 
 -module(gtp_u_kmod).
 
--compile({parse_transform, cut}).
-
 -behaviour(gen_server).
 
 %% API
@@ -41,8 +39,8 @@ start_link() ->
 init([]) ->
     {ok, #state{}}.
 
-handle_call({bind, Port}, _From, State) ->
-    Reply = gtp_u_kmod_port:bind(Port),
+handle_call({bind, Port}, {Owner, _} = _From, State) ->
+    Reply = gtp_u_kmod_port:bind(Port, Owner),
     {reply, Reply, State};
 
 handle_call(_Request, _From, State) ->

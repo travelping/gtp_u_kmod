@@ -9,7 +9,7 @@
 -behavior(gen_server).
 
 %% API
--export([dev_create/4, create_pdp_context/6, update_pdp_context/6, delete_pdp_context/6]).
+-export([dev_create/4, create_pdp_context/6, update_pdp_context/7, delete_pdp_context/6]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -35,8 +35,8 @@ dev_create(Device, FD0, FD1u, Opts) ->
 create_pdp_context(Server, Version, SGSN, MS, LocalTEI, RemoteTEI) ->
     gen_server:call(Server, {create_pdp_context, Version, SGSN, MS, LocalTEI, RemoteTEI}).
 
-update_pdp_context(Server, Version, SGSN, MS, LocalTEI, RemoteTEI) ->
-    gen_server:call(Server, {update_pdp_context, Version, SGSN, MS, LocalTEI, RemoteTEI}).
+update_pdp_context(Server, Version, SGSN, MS, LocalTEI, RemoteTEI, Replace) ->
+    gen_server:call(Server, {update_pdp_context, Version, SGSN, MS, LocalTEI, RemoteTEI, Replace}).
 
 delete_pdp_context(Server, Version, SGSN, MS, LocalTEI, RemoteTEI) ->
     gen_server:call(Server, {delete_pdp_context, Version, SGSN, MS, LocalTEI, RemoteTEI}).
@@ -73,7 +73,8 @@ init([Device, FD0, FD1u, Opts]) ->
     {ok, GtpNl} = gen_socket:socket(netlink, raw, ?NETLINK_GENERIC),
     ok = gen_socket:bind(GtpNl, netlink:sockaddr_nl(netlink, 0, 0)),
 
-    {ok, #state{ns = NsFd, gtp_nl = GtpNl, rt_nl = RtNl, rt_nl_ns = RtNlNs, gtp_genl_family = GtpGenlFam, gtp_ifidx = GtpIfIdx}}.
+    {ok, #state{ns = NsFd, gtp_nl = GtpNl, rt_nl = RtNl, rt_nl_ns = RtNlNs,
+		gtp_genl_family = GtpGenlFam, gtp_ifidx = GtpIfIdx}}.
 
 handle_call({create_pdp_context, Version, SGSN, MS, LocalTID, RemoteTID},
 	    _From, #state{ns = NsFd, gtp_nl = GtpNl, gtp_genl_family = GtpGenlFam,
@@ -98,7 +99,7 @@ handle_call({create_pdp_context, Version, SGSN, MS, LocalTID, RemoteTID},
 
     {reply, Reply, State};
 
-handle_call({update_pdp_context, Version, SGSN, MS, LocalTID, RemoteTID},
+handle_call({update_pdp_context, Version, SGSN, MS, LocalTID, RemoteTID, Replace},
 	    _From, #state{ns = NsFd, gtp_nl = GtpNl, gtp_genl_family = GtpGenlFam,
 			  gtp_ifidx = GtpIfIdx} = State) ->
     lager:debug("update_pdp_context: ~w, ~w, ~w, ~w, ~w", [Version, SGSN, MS, LocalTID, RemoteTID]),
@@ -111,8 +112,9 @@ handle_call({update_pdp_context, Version, SGSN, MS, LocalTID, RemoteTID},
 		   {i_tid,        LocalTID},                  %% TODO: GTPv0 TID and FLOW
 		   {o_tid,        RemoteTID}],
     GtpReq = {new, 0, 0, GtpReqAttrs},
+    Flags = [ack, request | [?NLM_F_REPLACE || Replace] ],
     Req = #netlink{type  = gtp,
-		   flags = [?NLM_F_REPLACE, ack, request],
+		   flags = Flags,
 		   seq   = erlang:unique_integer([positive]),
 		   pid   = 0,
 		   msg   = GtpReq},
