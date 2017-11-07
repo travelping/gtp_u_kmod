@@ -193,6 +193,13 @@ handle_cast({send, IP, Port, Data}, #state{gtp1u = GTP1u} = State) ->
     lager:debug("Send Result: ~p", [R]),
     {noreply, State};
 
+handle_cast({send_end_marker, IP, TEI}, #state{gtp1u = GTP1u} = State) ->
+    Msg = #gtp{version = v1, type = end_marker, tei = TEI, ie = []},
+    Data = gtp_packet:encode(Msg),
+    R = gen_socket:sendto(GTP1u, {inet4, IP, ?GTP1u_PORT}, Data),
+    lager:debug("Send Result: ~p", [R]),
+    {noreply, State};
+
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -336,9 +343,7 @@ error_indication_report(IP,
 			    },
 			#state{owner = Owner, tid = TID})
   when is_pid(Owner) ->
-    MS = #tunnel{seid = '$1', local_teid = '_',
-		 peer_ip = bin2ip(PeerIP), peer_teid = PeerTEI,
-		 ms = '_', far_id = '_'},
+    MS = #tunnel{seid = '$1', peer_ip = bin2ip(PeerIP), peer_teid = PeerTEI, _ = '_'},
     case ets:match(TID, MS) of
 	[[SEID]] ->
 	    FTEID = #f_teid{ipv4 = IP, teid = PeerTEI},
@@ -429,10 +434,21 @@ update_far(#{far_id := FarId,
 		      teid = PeerTEI
 		     }
 	      }
-	    }, #tunnel{far_id = FarId} = Tunnel) ->
+	    } = UpdFAR, #tunnel{far_id = FarId} = Tunnel) ->
+    SxSMReqFlags = maps:get(sxsmreq_flags, UpdFAR, []),
+    case proplists:get_bool(sndem, SxSMReqFlags) of
+	true ->
+	    send_end_marker(Tunnel),
+	    ok;
+	_ ->
+	    ok
+    end,
     Tunnel#tunnel{
       peer_ip = PeerIP,
       peer_teid = PeerTEI
      };
 update_far(_, Tunnel) ->
     Tunnel.
+
+send_end_marker(#tunnel{peer_ip = IP, peer_teid = TEI}) ->
+    gen_server:cast(self(), {send_end_marker, IP, TEI}).

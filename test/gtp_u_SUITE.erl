@@ -367,6 +367,8 @@ session_modification_request(Config) ->
     {ok, Pid, ?TEST_GSN} = gen_server:call('gtp-u', {bind, GtpIntf}),
     ok = gen_server:call(Pid, clear),
 
+    S = make_gtp_socket(Config),
+
     Request1 = make_sgi_session(SEID, GtpIntf,TEI, PeerIP, PeerTEI, SgiIntf, MSv4),
 
     ?match(ok, gen_server:call(Pid, Request1)),
@@ -388,8 +390,19 @@ session_modification_request(Config) ->
     ?match({error,_}, gen_server:call(Pid, Request4)),
     validate_tunnel(Pid, SEID, GtpIntf, TEI, UpdPeerIP, UpdPeerTEI, SgiIntf, MSv4),
 
-    Request5 = {SEID, session_deletion_request, #{}},
-    ?equal(ok, gen_server:call(Pid, Request5)),
+    %% make sure we did not get an End Marker
+    ?equal({error,timeout}, gen_udp:recv(S, 4096, ?TIMEOUT)),
+
+    Request5 = make_update_far(SEID, GtpIntf, PeerIP, PeerTEI, true),
+
+    ?match(ok, gen_server:call(Pid, Request5)),
+    validate_tunnel(Pid, SEID, GtpIntf, TEI, PeerIP, PeerTEI, SgiIntf, MSv4),
+
+    %% make sure we DID get an End Marker
+    ?match(#gtp{type = end_marker, tei = UpdLeftPeerTEI}, recv_pdu(S, ?TIMEOUT)),
+
+    Request6 = {SEID, session_deletion_request, #{}},
+    ?equal(ok, gen_server:call(Pid, Request6)),
 
     ?equal([], gtp_u_kmod_port:all(Pid)),
 
@@ -661,14 +674,21 @@ make_update_pdr(SEID, Intf, TEI) ->
     {SEID, session_modification_request, IEs}.
 
 make_update_far(SEID, Intf, PeerIP, PeerTEI) ->
-    IEs = #{cp_f_seid => SEID,
-	    update_far => [#{far_id => 1, apply_action => [forward],
-			     update_forwarding_parameters => #{
-			       destination_interface => Intf,
-			       outer_header_creation =>
-				   #f_teid{ipv4 = PeerIP,
-					   teid = PeerTEI}}}]
-	   },
+    make_update_far(SEID, Intf, PeerIP, PeerTEI, false).
+
+make_update_far(SEID, Intf, PeerIP, PeerTEI, SndEM) ->
+    FAR0 = #{far_id => 1, apply_action => [forward],
+	     update_forwarding_parameters => #{
+	       destination_interface => Intf,
+	       outer_header_creation =>
+		   #f_teid{ipv4 = PeerIP,
+			   teid = PeerTEI}}},
+    FAR = if SndEM =:= true ->
+		  FAR0#{sxsmreq_flags => [sndem]};
+	     true ->
+		  FAR0
+	  end,
+    IEs = #{cp_f_seid => SEID, update_far => [FAR]},
     {SEID, session_modification_request, IEs}.
 
 make_forward_session(_SEID,
