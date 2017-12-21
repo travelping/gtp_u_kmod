@@ -9,9 +9,3 @@
 -define(GTP1c_PORT,	2123).
 -define(GTP1u_PORT,	2152).
 -define(GTP2c_PORT,	2123).
-
--record(f_teid, {
-	  ipv4                  :: inet:ip4_address(),
-	  ipv6                  :: inet:ip6_address(),
-	  teid                  :: 0..16#ffffffff
-	 }).

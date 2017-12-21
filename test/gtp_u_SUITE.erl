@@ -12,6 +12,7 @@
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("gtplib/include/gtp_packet.hrl").
+-include_lib("pfcplib/include/pfcp_packet.hrl").
 -include("../include/gtp_u_kmod.hrl").
 
 -define(TIMEOUT, 2000).
@@ -332,8 +333,8 @@ session_deletion_request(Config) ->
     ok = gen_server:call(Pid, clear),
 
     Request1 = make_sgi_session(SEID, GtpIntf,TEI, PeerIP, PeerTEI, SgiIntf, MSv4),
-    Request2 = {InvalidSEID, session_deletion_request, #{}},
-    Request3 = {SEID, session_deletion_request, #{}},
+    Request2 = make_pfcp(session_deletion_request, InvalidSEID, #{}),
+    Request3 = make_pfcp(session_deletion_request, SEID, #{}),
 
     ?match(ok, gen_server:call(Pid, Request1)),
     validate_tunnel(Pid, SEID, GtpIntf, TEI,  PeerIP,  PeerTEI, SgiIntf, MSv4),
@@ -399,9 +400,9 @@ session_modification_request(Config) ->
     validate_tunnel(Pid, SEID, GtpIntf, TEI, PeerIP, PeerTEI, SgiIntf, MSv4),
 
     %% make sure we DID get an End Marker
-    ?match(#gtp{type = end_marker, tei = UpdLeftPeerTEI}, recv_pdu(S, ?TIMEOUT)),
+    ?match(#gtp{type = end_marker, tei = UpdPeerTEI}, recv_pdu(S, ?TIMEOUT)),
 
-    Request6 = {SEID, session_deletion_request, #{}},
+    Request6 = make_pfcp(session_deletion_request, SEID, #{}),
     ?equal(ok, gen_server:call(Pid, Request6)),
 
     ?equal([], gtp_u_kmod_port:all(Pid)),
@@ -424,7 +425,7 @@ forward_data(Config) ->
     ok = gen_server:call(Pid, clear),
 
     Request1 = make_sgi_session(SEID, GtpIntf,TEI, PeerIP, PeerTEI, SgiIntf, MSv4),
-    Request2 = {SEID, session_deletion_request, #{}},
+    Request2 = make_pfcp(session_deletion_request, SEID, #{}),
 
     ?match(ok, gen_server:call(Pid, Request1)),
     validate_tunnel(Pid, SEID, GtpIntf, TEI,  PeerIP,  PeerTEI, SgiIntf, MSv4),
@@ -477,13 +478,17 @@ error_indication(Config) ->
 		seq_no = undefined, ie = MsgIE},
     send_pdu(S, Msg),
 
+    ClientIP = ip2bin(?CLIENT_IP),
     receive
-	{SEID, session_report_request, IEs2} ->
-	    ?match(#{report_type := [error_indication_report],
+	#pfcp{version = v1, type = session_report_request, seid = SEID, ie = IEs2} ->
+	    ?match(#{report_type := #report_type{erir = 1},
 		     error_indication_report :=
-			 [#{remote_f_teid :=
-				#f_teid{ipv4 = ?CLIENT_IP, teid = PeerTEI}
-			   }]
+			 #error_indication_report{
+			    group = #{
+			      f_teid :=
+				  #f_teid{ipv4 = ClientIP, teid = PeerTEI}
+			     }
+			   }
 		    }, IEs2)
     after ?TIMEOUT ->
 	    ct:fail(timeout)
@@ -642,54 +647,120 @@ validate_tunnel(Pid, SEID, _GtpIntf, TEI,  PeerIP,  PeerTEI, _SgiIntf, MSv4) ->
 		    ms = MSv4}], gtp_u_kmod_port:lookup(Pid, SEID)),
     ok.
 
+network_instance(Name) when is_atom(Name) ->
+    #network_instance{instance = [atom_to_binary(Name, latin1)]}.
+
+make_pfcp(Type, SEID, IEs) ->
+    PFCP = #pfcp{version = v1, type = Type, seid = SEID, seq_no = 0, ie = IEs},
+    pfcp_packet:encode(PFCP),
+    pfcp_packet:to_map(PFCP).
+
 make_sgi_session(SEID, GtpIntf, TEI, PeerIP, PeerTEI, SgiIntf, MSv4) ->
-    IEs = #{cp_f_seid => SEID,
-	    create_pdr => [#{pdr_id => 1, precedence => 100,
-			     pdi => #{source_interface => GtpIntf,
-				      local_f_teid => #f_teid{teid = TEI}},
-			     outer_header_removal => true, far_id => 2},
-			   #{pdr_id => 2, precedence => 100,
-			     pdi => #{source_interface => SgiIntf,
-				      ue_ip_address => {dst, MSv4}},
-			     outer_header_removal => false, far_id => 1}],
-	    create_far => [#{far_id => 1, apply_action => [forward],
-			     forwarding_parameters => #{
-			       destination_interface => GtpIntf,
-			       outer_header_creation =>
-				   #f_teid{ipv4 = PeerIP,
-					   teid = PeerTEI}}},
-			   #{far_id => 2, apply_action => [forward],
-			     forwarding_parameters => #{
-			       destination_interface => SgiIntf}}]
+    IEs =
+	[#f_seid{seid = SEID},
+	 #create_pdr{
+	    group =
+		[#pdr_id{id = 1},
+		 #precedence{precedence = 100},
+		 #pdi{
+		    group =
+			[#source_interface{interface = 'Core'},
+			 network_instance(GtpIntf),
+			 #f_teid{teid = TEI}]
+		   },
+		 #outer_header_removal{header = 'GTP-U/UDP/IPv4'},
+		 #far_id{id = 2},
+		 #urr_id{id = 1}]
 	   },
-    {SEID, session_establishment_request, IEs}.
+	 #create_pdr{
+	    group =
+		[#pdr_id{id = 2},
+		 #precedence{precedence = 100},
+		 #pdi{
+		    group =
+			[#source_interface{interface = 'SGi-LAN'},
+			 network_instance(SgiIntf),
+			 #ue_ip_address{type = dst, ipv4 = ip2bin(MSv4)}]
+		   },
+		 #far_id{id = 1},
+		 #urr_id{id = 1}]
+	   },
+	 #create_far{
+	    group =
+		[#far_id{id = 1},
+		 #apply_action{forw = 1},
+		 #forwarding_parameters{
+		    group =
+			[#destination_interface{interface = 'Core'},
+			 network_instance(GtpIntf),
+			 #outer_header_creation{
+			    type = 'GTP-U/UDP/IPv4',
+			    teid = PeerTEI,
+			    address = ip2bin(PeerIP)
+			   }
+			]
+		   }
+		]
+	   },
+	 #create_far{
+	    group =
+		[#far_id{id = 2},
+		 #apply_action{forw = 1},
+		 #forwarding_parameters{
+		    group =
+			[#destination_interface{interface = 'SGi-LAN'},
+			 network_instance(SgiIntf)]
+		   }
+		]
+	   }
+	],
+    make_pfcp(session_establishment_request, 0, IEs).
 
 make_update_pdr(SEID, Intf, TEI) ->
-    IEs = #{cp_f_seid => SEID,
-	    update_pdr => [#{pdr_id => 1, precedence => 100,
-			     pdi => #{source_interface => Intf,
-				      local_f_teid => #f_teid{teid = TEI}},
-			     outer_header_removal => true, far_id => 2}]
-	   },
-    {SEID, session_modification_request, IEs}.
+    IEs =
+	[#f_seid{seid = SEID},
+	 #update_pdr{
+	     group =
+		 [#pdr_id{id =1},
+		  #precedence{precedence = 100},
+		  #pdi{
+		     group =
+			 [#source_interface{interface = 'Core'},
+			  network_instance(Intf),
+			  #f_teid{teid = TEI}]
+		    },
+		  #outer_header_removal{header = 'GTP-U/UDP/IPv4'},
+		  #far_id{id = 2}]
+	   }
+	],
+    make_pfcp(session_modification_request, SEID, IEs).
 
 make_update_far(SEID, Intf, PeerIP, PeerTEI) ->
     make_update_far(SEID, Intf, PeerIP, PeerTEI, false).
 
 make_update_far(SEID, Intf, PeerIP, PeerTEI, SndEM) ->
-    FAR0 = #{far_id => 1, apply_action => [forward],
-	     update_forwarding_parameters => #{
-	       destination_interface => Intf,
-	       outer_header_creation =>
-		   #f_teid{ipv4 = PeerIP,
-			   teid = PeerTEI}}},
-    FAR = if SndEM =:= true ->
-		  FAR0#{sxsmreq_flags => [sndem]};
-	     true ->
-		  FAR0
-	  end,
-    IEs = #{cp_f_seid => SEID, update_far => [FAR]},
-    {SEID, session_modification_request, IEs}.
+    IEs =
+	[#f_seid{seid = SEID},
+	 #update_far{
+	    group =
+		[#far_id{id = 1},
+		 #apply_action{forw = 1},
+		 #update_forwarding_parameters{
+		    group =
+			[#destination_interface{interface = 'Core'},
+			 network_instance(Intf),
+			 #outer_header_creation{
+			    type = 'GTP-U/UDP/IPv4',
+			    teid = PeerTEI,
+			    address = ip2bin(PeerIP)
+			   }
+			 | [#sxsmreq_flags{sndem = 1} || SndEM =:= true]
+			]
+		   }
+		]
+	   }
+	],
+    make_pfcp(session_modification_request, SEID, IEs).
 
 make_forward_session(_SEID,
 		     _LeftIntf,  _LeftTEI,  _LeftPeerIP,  _LeftPeerTEI,

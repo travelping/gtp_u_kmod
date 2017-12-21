@@ -20,6 +20,7 @@
 -include_lib("stdlib/include/ms_transform.hrl").
 -include_lib("gen_socket/include/gen_socket.hrl").
 -include_lib("gtplib/include/gtp_packet.hrl").
+-include_lib("pfcplib/include/pfcp_packet.hrl").
 -include("include/gtp_u_kmod.hrl").
 
 %% API
@@ -119,14 +120,16 @@ handle_call({bind, Owner}, _From, #state{ip = IP} = State) ->
     Reply = {ok, self(), IP},
     {reply, Reply, State#state{owner = Owner}};
 
-handle_call({SEID, session_establishment_request, SER} = _Request,
+handle_call(#pfcp{version = v1, type = session_establishment_request,
+		  ie = #{f_seid := #f_seid{seid = SEID}} = SER} = _Request,
 	    _From, #state{gtp_dev = GTPDev, tid = TID} = State) ->
 
-    lager:info("KMOD Port Session Establishment Request ~p: ~p", [_From, _Request]),
+    lager:info("KMOD Port Session Establishment Request ~p: ~p",
+	       [_From, lager:pr(_Request, ?MODULE)]),
 
     Tunnel0 = #tunnel{seid = SEID},
-    Tunnel1 = lists:foldr(fun create_pdr/2, Tunnel0, maps:get(create_pdr, SER, [])),
-    Tunnel = lists:foldr(fun create_far/2, Tunnel1, maps:get(create_far, SER, [])),
+    Tunnel1 = foreach(fun create_pdr/2, Tunnel0, maps:get(create_pdr, SER, [])),
+    Tunnel = foreach(fun create_far/2, Tunnel1, maps:get(create_far, SER, [])),
 
     ets:insert_new(TID, Tunnel),
     #tunnel{local_teid = LocalTEI, peer_ip = PeerIP,
@@ -134,15 +137,17 @@ handle_call({SEID, session_establishment_request, SER} = _Request,
     Reply = gtp_u_kernel:create_pdp_context(GTPDev, 1, PeerIP, IPv4, LocalTEI, PeerTEI),
     {reply, Reply, State};
 
-handle_call({SEID, session_modification_request, SMR} = _Request,
+handle_call(#pfcp{type = session_modification_request, seid = OldSEID, ie = SMR} = _Request,
 	    _From, #state{gtp_dev = GTPDev, tid = TID} = State) ->
 
-    lager:info("KMOD Port Session Modification Request ~p: ~p", [_From, _Request]),
+    lager:info("KMOD Port Session Modification Request ~p: ~p",
+	       [_From, lager:pr(_Request, ?MODULE)]),
     Reply =
-	case ets:take(TID, SEID) of
+	case ets:take(TID, OldSEID) of
 	    [#tunnel{local_teid = OldLocalTEI, ms = OldIPv4} = Tunnel0] ->
-		Tunnel1 = lists:foldr(fun update_pdr/2, Tunnel0, maps:get(update_pdr, SMR, [])),
-		Tunnel = lists:foldr(fun update_far/2, Tunnel1, maps:get(update_far, SMR, [])),
+		Tunnel1 = update_seid(SMR, Tunnel0),
+		Tunnel2 = foreach(fun update_pdr/2, Tunnel1, maps:get(update_pdr, SMR, [])),
+		Tunnel = foreach(fun update_far/2, Tunnel2, maps:get(update_far, SMR, [])),
 		#tunnel{local_teid = LocalTEI, peer_ip = PeerIP,
 			peer_teid = PeerTEI, ms = IPv4} = Tunnel,
 		Replace = OldLocalTEI /= LocalTEI orelse OldIPv4 /= IPv4,
@@ -161,10 +166,10 @@ handle_call({SEID, session_modification_request, SMR} = _Request,
 	end,
     {reply, Reply, State};
 
-handle_call({SEID, session_deletion_request, _} = _Request,
+handle_call(#pfcp{type = session_deletion_request, seid = SEID} = _Request,
 	    _From, #state{gtp_dev = GTPDev, tid = TID} = State) ->
 
-    lager:info("KMOD Session Deletion Request ~p: ~p", [_From, _Request]),
+    lager:info("KMOD Session Deletion Request ~p: ~p", [_From, lager:pr(_Request, ?MODULE)]),
     case ets:take(TID, SEID) of
 	[#tunnel{local_teid = LocalTEI, peer_ip = PeerIP, peer_teid = PeerTEI, ms = IPv4}] ->
 	    Reply = gtp_u_kernel:delete_pdp_context(GTPDev, 1, PeerIP, IPv4, LocalTEI, PeerTEI),
@@ -184,8 +189,8 @@ handle_call(clear, _From, #state{gtp_dev = GTPDev, tid = TID} = State) ->
     {reply, ok, State};
 
 handle_call(_Request, _From, State) ->
-    lager:info("KMOD Port Call ~p: ~p", [_From, _Request]),
-    Reply = ok,
+    lager:info("KMOD Port Call ~p: ~p", [_From, lager:pr(_Request, ?MODULE)]),
+    Reply = error,
     {reply, Reply, State}.
 
 handle_cast({send, IP, Port, Data}, #state{gtp1u = GTP1u} = State) ->
@@ -219,6 +224,12 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+foreach(Fun, Acc, List) when is_list(List) ->
+    lists:foldl(Fun, Acc, List);
+foreach(Fun, Acc, Term) ->
+    Fun(Term, Acc).
+
 make_gtp_socket(NetNs, {_,_,_,_} = IP, Port, Opts) when is_list(NetNs) ->
     {ok, Socket} = gen_socket:socketat(NetNs, inet, dgram, udp),
     bind_gtp_socket(Socket, IP, Port, Opts);
@@ -346,13 +357,13 @@ error_indication_report(IP,
     MS = #tunnel{seid = '$1', peer_ip = bin2ip(PeerIP), peer_teid = PeerTEI, _ = '_'},
     case ets:match(TID, MS) of
 	[[SEID]] ->
-	    FTEID = #f_teid{ipv4 = IP, teid = PeerTEI},
-	    SRR = #{
-	      report_type => [error_indication_report],
-	      error_indication_report =>
-		  [#{remote_f_teid => FTEID}]
-	     },
-	    Owner ! {SEID, session_report_request, SRR};
+	    SRR =
+		[#report_type{erir = 1},
+		 #error_indication_report{
+		    group = [#f_teid{ipv4 = ip2bin(IP), teid = PeerTEI}]}],
+	    Request = #pfcp{version = v1, type = session_report_request,
+			    seid = SEID, ie = SRR},
+	    Owner ! pfcp_packet:to_map(Request);
 	_ ->
 	    ok
     end;
@@ -379,72 +390,122 @@ bin2ip(<<A:16, B:16, C:16, D:16, E:16, F:16, G:16, H:16>>) ->
 %% Sx DP API helpers
 %%====================================================================
 
-create_pdr(#{pdi := #{
-	       local_f_teid := #f_teid{teid = LocalTEI}
-	      },
-	     outer_header_removal := true
-	    }, Tunnel) ->
+create_pdr(
+  #create_pdr{
+     group =
+	 #{pdi :=
+	       #pdi{
+		  group = #{
+		    f_teid := #f_teid{teid = LocalTEI}
+		   }
+		 },
+	   outer_header_removal :=
+	       #outer_header_removal{header = 'GTP-U/UDP/IPv4'}
+	  }
+    },
+  Tunnel) ->
     Tunnel#tunnel{
       local_teid = LocalTEI
      };
-create_pdr(#{pdi := #{
-	       ue_ip_address := {dst, IPv4}
-	      },
-	     outer_header_removal := false,
-	     far_id := FarId}, Tunnel) ->
+create_pdr(
+  #create_pdr{
+     group =
+	 #{pdi :=
+	       #pdi{
+		  group = #{
+		    ue_ip_address :=
+			#ue_ip_address{type = dst, ipv4 = IPv4}
+		   }
+		 },
+	   far_id := #far_id{id = FarId}
+	  }
+    }, Tunnel)
+  when IPv4 /= undefined ->
     Tunnel#tunnel{
       far_id = FarId,
-      ms = IPv4
+      ms = bin2ip(IPv4)
      }.
 
-create_far(#{far_id := FarId,
-	     apply_action := [forward],
-	     forwarding_parameters := #{
-	       outer_header_creation :=
-		   #f_teid{
-		      ipv4 = PeerIP,
-		      teid = PeerTEI
-		     }
-	      }
-	    }, #tunnel{far_id = FarId} = Tunnel) ->
+create_far(
+  #create_far{
+     group =
+	 #{far_id := #far_id{id = FarId},
+	   apply_action := #apply_action{forw = 1},
+	   forwarding_parameters :=
+	       #forwarding_parameters{
+		  group = #{
+		    outer_header_creation :=
+			#outer_header_creation{
+			   type = 'GTP-U/UDP/IPv4',
+			   teid = PeerTEI,
+			   address = PeerIP
+			  }
+		    }
+		 }
+	  }
+    },
+  #tunnel{far_id = FarId} = Tunnel) ->
     Tunnel#tunnel{
-      peer_ip = PeerIP,
+      peer_ip = bin2ip(PeerIP),
       peer_teid = PeerTEI
      };
 create_far(_, Tunnel) ->
     Tunnel.
 
-update_pdr(#{pdi := #{
-	       local_f_teid := #f_teid{teid = LocalTEI}
-	      },
-	     outer_header_removal := true
-	    }, Tunnel) ->
+update_seid(#{f_seid := #f_seid{seid = SEID}}, Tunnel)
+  when is_integer(SEID) ->
+    Tunnel#tunnel{seid = SEID};
+update_seid(_, Tunnel) ->
+    Tunnel.
+
+update_pdr(
+  #update_pdr{
+     group =
+	 #{pdi :=
+	       #pdi{
+		  group = #{
+		    f_teid := #f_teid{teid = LocalTEI}
+		   }
+		 },
+	   outer_header_removal :=
+	       #outer_header_removal{header = 'GTP-U/UDP/IPv4'}
+	  }
+    },
+  Tunnel) ->
     Tunnel#tunnel{
       local_teid = LocalTEI
      };
 update_pdr(_, Tunnel) ->
     Tunnel.
 
-update_far(#{far_id := FarId,
-	     apply_action := [forward],
-	     update_forwarding_parameters := #{
-	       outer_header_creation :=
-		   #f_teid{
-		      ipv4 = PeerIP,
-		      teid = PeerTEI
-		     }
-	      }
-	    } = UpdFAR, #tunnel{far_id = FarId} = Tunnel) ->
-    SxSMReqFlags = maps:get(sxsmreq_flags, UpdFAR, []),
-    case proplists:get_bool(sndem, SxSMReqFlags) of
-	true ->
+update_far(
+  #update_far{
+     group =
+	 #{far_id := #far_id{id = FarId},
+	   apply_action := #apply_action{forw = 1},
+	   update_forwarding_parameters :=
+	       #update_forwarding_parameters{
+		  group = #{
+		    outer_header_creation :=
+			#outer_header_creation{
+			   type = 'GTP-U/UDP/IPv4',
+			   teid = PeerTEI,
+			   address = PeerIP
+			  }
+		   } = UpdFAR
+		 }
+	  }
+    },
+  #tunnel{far_id = FarId} = Tunnel) ->
+    case UpdFAR of
+	#{sxsmreq_flags := #sxsmreq_flags{sndem = 1}} ->
 	    send_end_marker(Tunnel),
 	    ok;
 	_ ->
 	    ok
     end,
     Tunnel#tunnel{
-      peer_ip = PeerIP,
+      peer_ip = bin2ip(PeerIP),
       peer_teid = PeerTEI
      };
 update_far(_, Tunnel) ->
