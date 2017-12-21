@@ -17,7 +17,7 @@ RUNNING
 
 Requirements:
 
-* Erlang 19.0
+* Erlang 20.0
 * Linux 4.6 with gtp kernel module
 
 GTP-u-KMod is the kernel based GTP-U data path instance for [erGW](https://github.com/travelping/ergw)
@@ -53,4 +53,4 @@ A GTP VRF describes a virtual Linux network interface that serves a give client 
 <!-- Badges -->
 [travis]: https://travis-ci.org/travelping/gtp_u_kmod
 [travis badge]: https://img.shields.io/travis/travelping/gtp_u_kmod/master.svg?style=flat-square
-[erlang version badge]: https://img.shields.io/badge/erlang-R19.3%20to%2020.1-blue.svg?style=flat-square
+[erlang version badge]: https://img.shields.io/badge/erlang-R20.0%20to%2020.1-blue.svg?style=flat-square
