@@ -47,10 +47,8 @@ delete_pdp_context(Server, Version, SGSN, MS, LocalTEI, RemoteTEI) ->
 
 init([Device, FD0, FD1u, Opts]) ->
     VrfOpts = proplists:get_value(vrf, Opts, []),
-    {ok, FDesc} = get_ns_fd(VrfOpts),
-    #file_descriptor{module = prim_file,
-		     data   = {_Port, NsFd}} = FDesc,
-
+    {ok, FDesc} = get_ns_fdesc(VrfOpts),
+    NsFd = get_ns_fd(FDesc),
     {RtNl, RtNlNs} = netlink_sockets(VrfOpts),
     CreateGTPLinkInfo = [{fd0, FD0}, {fd1, FD1u}, {hashsize, 131072}],
     CreateGTPData = netlink:linkinfo_enc(inet, "gtp", CreateGTPLinkInfo),
@@ -168,13 +166,24 @@ code_change(_OldVsn, State, _Extra) ->
 -define(SELF_NET_NS, "/proc/self/ns/net").
 -define(SIOCGIFINDEX, 16#8933).
 
-get_ns_fd(Opts) ->
+get_ns_fdesc(Opts) ->
     try
 	{netns, NetNs} = lists:keyfind(netns, 1, Opts),
 	{ok, _} = file:open(filename:join("/var/run/netns", NetNs), [raw, read])
     catch
 	_:_ ->
 	    {ok, _} = file:open(?SELF_NET_NS, [raw, read])
+    end.
+
+get_ns_fd(FDesc) ->
+    lager:notice("FDesc: ~p~n", [FDesc]),
+    case FDesc of
+    #file_descriptor{module = prim_file} ->
+        #file_descriptor{data = {_, NsFd}} = FDesc,
+        NsFd;
+    #file_descriptor{module = _} ->
+        PrivFDesc = FDesc#file_descriptor.data,
+        binary:decode_unsigned(prim_file:get_handle(PrivFDesc),little)
     end.
 
 %% get_ifindex(Name, Opts) when is_list(Name) ->
